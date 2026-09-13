@@ -23,6 +23,9 @@ from typing import Optional
 
 import asyncssh
 
+from core.i18n import get_locale, set_locale, t
+from core.menu import TerminalMenu
+
 logger = logging.getLogger("openbastion.gateway")
 
 DEFAULT_HOST_KEY_PATH = Path("data/ssh_host_key")
@@ -51,15 +54,14 @@ class OpenBastionSSHServer(asyncssh.SSHServer):
     def validate_password(self, username: str, password: str) -> bool:
         """
         驗證連線者之帳號密碼。
-        Validate username and password against system configuration.
+        嚴格遵守 Fail-Closed (Default Deny) 原則：
+        在 Phase 3 使用者資料庫就位前，系統無合法憑證，一律嚴格拒絕連線。
         """
-        # 本機預設管理員帳密驗證 (Default initial credentials check)
-        if username == "admin" and password in ("openbastion123", "admin123"):
-            logger.info("[AUTH_SUCCESS] SSH password authentication succeeded for '%s'", username)
-            return True
-
-        logger.warning("[AUTH_FAILED] SSH authentication failed for user '%s'", username)
+        logger.warning(t("log.auth_denied_no_db", username=username))
         return False
+
+
+MAX_INPUT_LENGTH = 256
 
 
 class GatewayListener:
@@ -93,16 +95,20 @@ class GatewayListener:
         if self.host_key_path.exists():
             try:
                 key = asyncssh.read_private_key(str(self.host_key_path))
-                logger.info("已載入主機金鑰: %s", self.host_key_path)
+                logger.info(t("log.host_key_loaded", path=str(self.host_key_path)))
                 return key
             except Exception as e:
-                logger.warning("讀取現有主機金鑰失敗，重新生成: %s", e)
+                logger.warning(t("log.host_key_load_failed", error=str(e)))
 
         # 自動生成 ED25519 私鑰
-        logger.info("未偵測到主機金鑰，正在生成專屬 ED25519 金鑰...")
+        logger.info(t("log.host_key_generating"))
         key = asyncssh.generate_private_key("ssh-ed25519")
         key.write_private_key(str(self.host_key_path))
-        logger.info("主機金鑰已成功持久化至: %s", self.host_key_path)
+        try:
+            os.chmod(self.host_key_path, 0o600)
+        except OSError:
+            pass
+        logger.info(t("log.host_key_persisted", path=str(self.host_key_path)))
         return key
 
     async def _handle_client(self, process: asyncssh.SSHServerProcess) -> None:
@@ -114,26 +120,17 @@ class GatewayListener:
         peername = process.get_extra_info("peername")
         client_ip = peername[0] if peername else "unknown"
 
-        logger.info("[SESSION_START] 使用者 '%s' 從 %s 成功建立會話", username, client_ip)
+        menu = TerminalMenu()
+        current_page = 1
+        view_mode = "system"
+        search_query = None
+        current_locale = get_locale()
 
-        # 終端歡迎橫幅 (Terminal Welcome Banner)
-        banner = (
-            "\r\n"
-            "======================================================================\r\n"
-            "  OpenBastion SSH-2.0 Gateway (Phase 1: Channel Baseline)\r\n"
-            "======================================================================\r\n"
-            f"  連線使用者 / User    : {username}\r\n"
-            f"  來源位址   / Source  : {client_ip}\r\n"
-            "  通訊協定   / Protocol: RFC 4253 SSH-2.0 (asyncssh)\r\n"
-            "======================================================================\r\n"
-            "輸入 'exit' 或 'quit' 即可中斷連線退出。\r\n"
-            "\r\n"
-        )
-        process.stdout.write(banner)
-        # 關鍵防踩坑時序保證：必須立即刷新緩衝區，避免客戶端黑畫面等待
+        # 初始繪製選單
+        process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
         await process.stdout.drain()
 
-        # 簡易命令列互動回環 (Interactive shell loop for Phase 1 channel verification)
+        # 終端命令列互動回環 (Terminal interactive loop with UX actions)
         while not process.is_closing():
             process.stdout.write("openbastion> ")
             await process.stdout.drain()
@@ -146,20 +143,67 @@ class GatewayListener:
             if not line:
                 break
 
-            cmd = line.strip()
-            if cmd in ("exit", "quit"):
-                process.stdout.write("連線即將關閉。Goodbye!\r\n")
+            raw_cmd = line.strip()
+            if not raw_cmd:
+                continue
+
+            if len(raw_cmd) > MAX_INPUT_LENGTH:
+                toolong_msg = t("gateway.cmd_too_long", locale=current_locale)
+                process.stdout.write(f"{toolong_msg}\r\n")
+                await process.stdout.drain()
+                continue
+
+            action, payload = menu.resolve_action(
+                raw_cmd,
+                current_page=current_page,
+                view_mode=view_mode,
+                search_query=search_query,
+            )
+
+            if action == "exit":
+                bye_msg = t("gateway.bye", locale=current_locale)
+                process.stdout.write(f"{bye_msg}\r\n")
                 await process.stdout.drain()
                 break
-            elif cmd == "ping":
-                process.stdout.write("pong (RFC 4253 channel healthy)\r\n")
+            elif action == "set_locale":
+                current_locale = payload
+                set_locale(current_locale)
+                process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
                 await process.stdout.drain()
-            elif cmd:
-                process.stdout.write(f"已接收指令: {cmd} (Phase 2 將接入完整 78 欄選單)\r\n")
+            elif action == "toggle_view":
+                view_mode = payload
+                process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
+                await process.stdout.drain()
+            elif action in ("next_page", "prev_page"):
+                current_page = payload
+                process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
+                await process.stdout.drain()
+            elif action == "search":
+                search_query = payload
+                current_page = 1
+                process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
+                await process.stdout.drain()
+            elif action == "clear_search":
+                search_query = None
+                current_page = 1
+                process.stdout.write(menu.render(page=current_page, view_mode=view_mode, search_query=search_query, locale=current_locale))
+                await process.stdout.drain()
+            elif action in ("connect", "auto_connect"):
+                target = payload
+                ep = f"{target.get('host')}:{target.get('port', 22)}"
+                msg_key = "gateway.auto_connected_to" if action == "auto_connect" else "gateway.connected_to"
+                header_msg = t(msg_key, locale=current_locale, name=target.get("name"), endpoint=ep)
+                sys_msg = t("gateway.system_type", locale=current_locale, system=target.get("system"), dept=target.get("dept"))
+
+                process.stdout.write(f"\r\n{header_msg}\r\n{sys_msg}\r\n\r\n")
+                await process.stdout.drain()
+            else:
+                invalid_msg = t("gateway.invalid_cmd", locale=current_locale)
+                process.stdout.write(f"{invalid_msg}\r\n")
                 await process.stdout.drain()
 
         process.exit(0)
-        logger.info("[SESSION_END] 使用者 '%s' 會話已正常關閉", username)
+        logger.info(t("log.session_end", username=username))
 
     async def start(self) -> None:
         """
@@ -176,7 +220,7 @@ class GatewayListener:
             process_factory=self._handle_client,
             encoding="utf-8",
         )
-        logger.info("OpenBastion SSH-2.0 閘道已啟動，監聽於 %s:%d", self.host, self.port)
+        logger.info(t("log.gateway_listening", host=self.host, port=self.port))
 
     async def stop(self) -> None:
         """
@@ -184,8 +228,8 @@ class GatewayListener:
         Gracefully stop SSH server.
         """
         if self._server:
-            logger.info("正在停止 SSH-2.0 閘道伺服器...")
+            logger.info(t("log.server_stopping"))
             self._server.close()
             await self._server.wait_closed()
             self._server = None
-            logger.info("SSH-2.0 閘道伺服器已安全停止")
+            logger.info(t("log.server_stopped"))

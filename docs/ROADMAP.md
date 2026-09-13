@@ -13,10 +13,10 @@
 ---
 
 ## Phase 2: 終端 78 欄位防破版選單與 PTY 刷新保證
-- [ ] 實裝 78 欄位主機導航選單
-- [ ] 使用 `unicodedata.east_asian_width` 算術，中英混排時邊框精準對齊
-- [ ] 輸出消毒：過濾有害 ANSI 控制序列，防止終端逃逸注入
-- [ ] `process.stdout.drain()` 非同步刷新保證，避免客戶端卡在緩衝區
+- [x] 實裝 78 欄位主機導航選單
+- [x] 使用 `unicodedata.east_asian_width` 算術，中英混排時邊框精準對齊
+- [x] 輸出消毒：過濾有害 ANSI 控制序列，防止終端逃逸注入
+- [x] `process.stdout.drain()` 非同步刷新保證，避免客戶端卡在緩衝區
 
 ---
 
