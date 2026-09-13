@@ -100,9 +100,21 @@ OpenBastion 是一套針對 Linux 與 Windows 伺服器終端管理設計的開�
 1. **零假資料原則**:
    - API 回傳的所有數值必須來自真實採集。查無資料時回傳空陣列 `{"total": 0, "events": []}`，未巡檢的指標標記為 `"-"` 或 `"UNKNOWN"`，不捏造假延遲數字。
 2. **多語系支援 (i18n)**:
-   - 前端靜態頁面不寫死中文字串，一律以 `data-i18n` 屬性對應語系字典檔（`locales/zh-TW.json`）。後端 Logger 一律英文，確保 ELK / Datadog 等日誌系統正則解析穩定。
+   - 前端靜態頁面不寫死中文字串，一律以 `data-i18n` 屬性對應語系字典檔（`locales/zh_TW.json`）。
 3. **樣式規範**:
    - 所有樣式集中於 CSS 樣式表，嚴禁 `style="..."` 內聯。數值欄位靠右對齊並套用 `font-variant-numeric: tabular-nums`，防止數字跳動時版面抖動。
+
+### 4.3 系統日誌規範 (System Logging Specification)
+1. **確定性狀態標籤 (Event Status Tag)**:
+   - 每條日誌開頭必須包含具備明確狀態語意的英數大寫標籤（如 `[BOOT_OK]`, `[BOOT_FAIL]`, `[AUTH_OK]`, `[AUTH_DENIED]`, `[AUTH_INACTIVE]`, `[SESSION_START]`, `[SESSION_CLOSED]`, `[KILL_SWITCH]`, `[RECONCILE_DONE]`），確保監控系統（ELK / Datadog / Loki）能精準過濾與指標告警。
+2. **中英雙軌並列 (Bilingual Message)**:
+   - 描述文字採「繁體中文為主 + (英文說明為輔)」，兼顧維運人員直觀閱讀親和力與國際開源檢索相容性。
+3. **強制 UTF-8 編碼 (Strict UTF-8 Encoding)**:
+   - 控制台與日誌 Handler 強制宣告 `encoding="utf-8"`，確保跨平台（Windows Terminal / Linux / Docker）零亂碼。
+4. **敏感資訊脫敏 (Data Sanitization)**:
+   - 嚴禁輸出密碼明文、私鑰內容或未加鹽憑證（符合 OWASP Top 10 與 CWE-532 規範）。
+5. **架構純淨與無漂移**:
+   - 後端 logger 直接以程式碼字串定義，不依賴 `locales/*.json` 選單字典，確保系統日誌格式具備確定性，不因連線者切換語言而漂移。
 
 ---
 

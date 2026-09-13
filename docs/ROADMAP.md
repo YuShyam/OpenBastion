@@ -21,10 +21,10 @@
 ---
 
 ## Phase 3: SQLite WAL 儲存與會話生命週期管理
-- [ ] 實裝 SQLite 儲存驅動，強制啟用 WAL 模式
-- [ ] 會話狀態機與 SessionContext 生命週期登錄
-- [ ] 系統異常中斷後的開機孤児對帳修復機制
-- [ ] 管理員手動緊急中斷連線能力 (Kill Switch)
+- [x] 實裝 SQLite 儲存驅動，強制啟用 WAL 模式
+- [x] 會話狀態機與 SessionContext 生命週期登錄
+- [x] 系統異常中斷後的開機孤兒對帳修復機制
+- [x] 管理員手動緊急中斷連線能力 (Kill Switch)
 
 ---
 

@@ -21,7 +21,7 @@ import unicodedata
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from core.i18n import get_locale, t
+from core.i18n import get_locale, get_supported_locales_info, match_locale, t
 
 # 正則表示式：匹配 ANSI 轉義序列、OSC 終端標題控制碼與各類控制符號
 ANSI_ESCAPE_RE = re.compile(
@@ -521,12 +521,17 @@ class TerminalMenu:
         if lower in ("v", "view", "toggle"):
             return "toggle_view", self.view_registry.get_next_view_id(view_mode)
 
-        # 語言切換指令 (lang zh / lang en)
-        if lower.startswith("lang"):
+        # 語言切換與清單查詢指令 (lang / lang ? / lang en / lang zh / ...)
+        if lower == "lang" or lower.startswith("lang ") or lower == "locale":
             parts = lower.split()
-            if len(parts) >= 2:
-                target_lang = "en_US" if parts[1].startswith("en") else "zh_TW"
-                return "set_locale", target_lang
+            if len(parts) == 1 or parts[1] in ("?", "help", "list"):
+                return "show_locales", None
+
+            target_locale = match_locale(parts[1])
+            if target_locale:
+                return "set_locale", target_locale
+            else:
+                return "unsupported_locale", parts[1]
 
         target_servers = servers if servers is not None else self.servers
         matched = self.filter_servers(target_servers, search_query)
