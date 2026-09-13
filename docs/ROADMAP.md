@@ -5,10 +5,10 @@
 ---
 
 ## Phase 1: SSH-2.0 通道監聽與主機金鑰管理
-- [ ] 引入 `asyncssh`，實裝標準 RFC 4253 SSH 伺服器
-- [ ] 自動生成並持久化 ED25519 主機金鑰 (`data/ssh_host_key`)
-- [ ] 支援本機帳號標準密碼鑑權回呼
-- [ ] 以原生 OpenSSH 客戶端連線驗證 (`ssh -p 2222 admin@127.0.0.1`)
+- [x] 引入 `asyncssh`，實裝標準 RFC 4253 SSH 伺服器
+- [x] 自動生成並持久化 ED25519 主機金鑰 (`data/ssh_host_key`)
+- [x] 支援本機帳號標準密碼鑑權回呼
+- [x] 以原生 OpenSSH 客戶端連線驗證 (`ssh -p 2222 admin@127.0.0.1`)
 
 ---
 

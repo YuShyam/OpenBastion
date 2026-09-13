@@ -1,0 +1,2 @@
+asyncssh>=2.14.0
+cryptography>=41.0.0
