@@ -62,7 +62,7 @@
   "banner.badge_jit": "JIT Ephemeral",
   "banner.access_mode": "Access Mode",
   "banner.mode_ca": "OpenSSH CA Certificate (Dynamically signed, 300s TTL)",
-  "banner.mode_jit": "JIT Isolated Account (Locked Password, CA Only)",
+  "banner.mode_jit": "JIT Dedicated Account (Dynamic Governance)",
   "banner.mode_direct": "Protocol Proxy (Native Target Account)",
   "banner.privilege": "Privileges",
   "banner.priv_inherit": "Inherit target account native privileges ({target_user})",
@@ -96,6 +96,7 @@
   "gateway.conn_failed": "Failed to connect to target host",
   "gateway.press_any_key": "Press any key to return to menu...",
   "gateway.session_ended": "Target session closed, returning to menu...",
+  "gateway.direct_session_ended": "Target session ended, bastion session closed normally...",
   "gateway.session_detached": "Session detached to slot [{slot}]. Type [r{slot}] or [r] to reattach",
   "gateway.no_detached_session": "No detached session available or target connection closed",
   "gateway.security_alert_blocked": "[SECURITY ALERT] High-risk command blocked: {blocked_cmd}",
@@ -144,6 +145,11 @@
   "cli.export_ca_complete": "Target host is now configured to accept short-lived certificates issued by OpenBastion.\n",
   "conn_err.denied": "Connection refused by target host (Authentication or key/certificate rejected)",
   "conn_err.timeout": "Connection to target host timed out (Exceeded {timeout}s): {endpoint}",
-  "conn_err.failed": "Failed to connect to target host: {error}"
+  "conn_err.failed": "Failed to connect to target host: {error}",
+  "jit.provisioning": "Provisioning JIT account and Sudoers RBAC rules...",
+  "jit.provision_failed": "JIT provisioning failed: {error}",
+  "jit.bootstrap_failed": "JIT bootstrap channel connection failed: {error}",
+  "jit.rbac_applied": "Successfully configured {user} RBAC rules ({role})",
+  "cli.admin_pwd_prompt": "Please enter password for administrator [{user}] to verify privileges: "
 }
 

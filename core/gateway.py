@@ -284,10 +284,12 @@ class OpenBastionSSHServer(asyncssh.SSHServer):
         """
         驗證連線者之帳號密碼 (接軌 SQLite PBKDF2 加鹽雜湊比對)。
         Validate client credentials against SQLite using PBKDF2 constant-time verification.
+        支援使用者名稱穿透直連語法 (如: admin#192.168.31.129 或 admin#3)。
         """
-        ok, user = self.gateway.storage.authenticate(username, password)
+        effective_user = username.split("#", 1)[0] if "#" in username else username
+        ok, user = self.gateway.storage.authenticate(effective_user, password)
         if ok and user:
-            logger.info("[AUTH_OK] 使用者 '%s' 密碼加鹽鑑權成功 (Password authentication succeeded)", username)
+            logger.info("[AUTH_OK] 使用者 '%s' [連線標的: '%s'] 密碼加鹽鑑權成功 (Password authentication succeeded)", effective_user, username)
             self.authenticated_user = user
             return True
 
@@ -324,7 +326,7 @@ class GatewayListener:
         self.vault = vault or CredentialVault()
         self.banner_provider = banner_provider or DefaultTemplateBannerProvider()
         self.ca_mgr = ca_mgr or CertificateAuthorityManager(storage=self.storage, vault=self.vault)
-        self.connector = connector or TargetConnector(vault=self.vault, ca_mgr=self.ca_mgr)
+        self.connector = connector or TargetConnector(vault=self.vault, ca_mgr=self.ca_mgr, storage=self.storage)
         self.recordings_dir = recordings_dir or Path("recordings")
         self._server: Optional[asyncssh.SSHServerAcceptor] = None
         self._active_connections: Dict[str, asyncssh.SSHServerProcess] = {}
@@ -452,7 +454,12 @@ class GatewayListener:
         處理連線後之客戶端 PTY 互動字元流與偏好狀態機。
         Handle connected client PTY interactive character stream and preference state machine.
         """
-        username = process.get_extra_info("username") or "unknown"
+        raw_username = process.get_extra_info("username") or "unknown"
+        direct_target = None
+        if "#" in raw_username:
+            username, direct_target = raw_username.split("#", 1)
+        else:
+            username = raw_username
         peername = process.get_extra_info("peername")
         client_ip = peername[0] if peername else "unknown"
 
@@ -483,6 +490,30 @@ class GatewayListener:
         current_locale = user_prefs.get("locale", get_locale())
         set_locale(current_locale)
 
+        # 輔助函式：解析穿透直連目標主機
+        def find_direct_host(target_str: str) -> Tuple[Optional[Dict[str, Any]], Optional[int]]:
+            query = target_str.strip()
+            # 1. 依序號查找 (如 #3 或 3)
+            num_str = query[1:] if query.startswith("#") else query
+            if num_str.isdigit():
+                idx = int(num_str)
+                if 1 <= idx <= len(db_hosts):
+                    return db_hosts[idx - 1], idx
+            # 2. 依主機 IP、名稱、別名或 IP:PORT 精確比對
+            for idx, h in enumerate(db_hosts, 1):
+                h_ip = h.get("internal_ip") or h.get("host")
+                h_port = str(h.get("port", 22))
+                h_name = h.get("name")
+                h_alias = h.get("alias")
+                h_host_id = h.get("host_id")
+                if query in (h_ip, f"{h_ip}:{h_port}", h.get("host"), f"{h.get('host')}:{h_port}", h_name, h_alias, h_host_id):
+                    return h, idx
+            return None, None
+
+        is_direct_connect = direct_target is not None
+        direct_executed = False
+        direct_host_index: Optional[int] = None
+
         # 輔助函式：動態取得當前暫掛會話狀態並繪製選單
         async def render_current_menu() -> str:
             d_list = await self.session_pool.get_active_sessions(username)
@@ -500,76 +531,91 @@ class GatewayListener:
                 detached_slots=d_slots if d_count > 0 else None,
             )
 
-        # 初始繪製選單
-        process.stdout.write(await render_current_menu())
-        await process.stdout.drain()
+        # 初始繪製選單 (若為穿透直連模式則跳過選單繪製)
+        if not is_direct_connect:
+            process.stdout.write(await render_current_menu())
+            await process.stdout.drain()
 
         # 終端命令列互動回環 (Terminal interactive loop with UX actions)
         input_state = {"last_cr": False}
         try:
             while not process.is_closing():
-                process.stdout.write("openbastion> ")
-                await process.stdout.drain()
-
-                line = await self._read_menu_input(process, input_state)
-                if line is None:
-                    break
-
-                raw_cmd = line.strip()
-                if not raw_cmd:
-                    continue
-
-                if len(raw_cmd) > MAX_INPUT_LENGTH:
-                    toolong_msg = t("gateway.cmd_too_long", locale=current_locale)
-                    process.stdout.write(f"{toolong_msg}\r\n")
+                if is_direct_connect:
+                    if direct_executed:
+                        break
+                    direct_executed = True
+                    matched_host, direct_idx = find_direct_host(direct_target)
+                    if not matched_host:
+                        not_found_msg = t("gateway.direct_target_not_found", locale=current_locale, default=f"查無指定之直連目標主機: {direct_target} (Target host not found)")
+                        process.stdout.write(f"\r\n\033[1;31m[ERROR] {not_found_msg}\033[0m\r\n")
+                        await process.stdout.drain()
+                        break
+                    action = "connect"
+                    payload = matched_host
+                    direct_host_index = direct_idx
+                else:
+                    process.stdout.write("openbastion> ")
                     await process.stdout.drain()
-                    continue
 
-                # 管理員緊急會話管理指令 (Admin Kill Switch & Sessions inspection)
-                if raw_cmd == "sessions":
-                    if role != "admin":
-                        perm_msg = t("gateway.permission_denied", locale=current_locale)
-                        process.stdout.write(f"{perm_msg}\r\n")
+                    line = await self._read_menu_input(process, input_state)
+                    if line is None:
+                        break
+
+                    raw_cmd = line.strip()
+                    if not raw_cmd:
+                        continue
+
+                    if len(raw_cmd) > MAX_INPUT_LENGTH:
+                        toolong_msg = t("gateway.cmd_too_long", locale=current_locale)
+                        process.stdout.write(f"{toolong_msg}\r\n")
                         await process.stdout.drain()
                         continue
-                    active_list = self.storage.list_active_sessions()
-                    header = t("gateway.sessions_header", locale=current_locale)
-                    process.stdout.write(f"\r\n{header}\r\n")
-                    if not active_list:
-                        process.stdout.write(f"  {t('gateway.no_other_sessions', locale=current_locale)}\r\n")
-                    else:
-                        for s in active_list:
-                            process.stdout.write(
-                                f"  * [{s['session_id']}] {s['username']} ({s['client_ip']}) - {s['started_at']}\r\n"
-                            )
-                    process.stdout.write("\r\n")
-                    await process.stdout.drain()
-                    continue
 
-                if raw_cmd.startswith("kill "):
-                    if role != "admin":
-                        perm_msg = t("gateway.permission_denied", locale=current_locale)
-                        process.stdout.write(f"{perm_msg}\r\n")
-                        await process.stdout.drain()
-                        continue
-                    parts = raw_cmd.split()
-                    if len(parts) >= 2:
-                        target_sid = parts[1]
-                        success = self.kill_session(target_sid)
-                        if success:
-                            msg = t("gateway.kill_success", locale=current_locale, session_id=target_sid)
+                    # 管理員緊急會話管理指令 (Admin Kill Switch & Sessions inspection)
+                    if raw_cmd == "sessions":
+                        if role != "admin":
+                            perm_msg = t("gateway.permission_denied", locale=current_locale)
+                            process.stdout.write(f"{perm_msg}\r\n")
+                            await process.stdout.drain()
+                            continue
+                        active_list = self.storage.list_active_sessions()
+                        header = t("gateway.sessions_header", locale=current_locale)
+                        process.stdout.write(f"\r\n{header}\r\n")
+                        if not active_list:
+                            process.stdout.write(f"  {t('gateway.no_other_sessions', locale=current_locale)}\r\n")
                         else:
-                            msg = t("gateway.kill_failed", locale=current_locale, session_id=target_sid)
-                        process.stdout.write(f"{msg}\r\n")
+                            for s in active_list:
+                                process.stdout.write(
+                                    f"  * [{s['session_id']}] {s['username']} ({s['client_ip']}) - {s['started_at']}\r\n"
+                                )
+                        process.stdout.write("\r\n")
                         await process.stdout.drain()
-                    continue
+                        continue
 
-                action, payload = menu.resolve_action(
-                    raw_cmd,
-                    current_page=current_page,
-                    view_mode=view_mode,
-                    search_query=search_query,
-                )
+                    if raw_cmd.startswith("kill "):
+                        if role != "admin":
+                            perm_msg = t("gateway.permission_denied", locale=current_locale)
+                            process.stdout.write(f"{perm_msg}\r\n")
+                            await process.stdout.drain()
+                            continue
+                        parts = raw_cmd.split()
+                        if len(parts) >= 2:
+                            target_sid = parts[1]
+                            success = self.kill_session(target_sid)
+                            if success:
+                                msg = t("gateway.kill_success", locale=current_locale, session_id=target_sid)
+                            else:
+                                msg = t("gateway.kill_failed", locale=current_locale, session_id=target_sid)
+                            process.stdout.write(f"{msg}\r\n")
+                            await process.stdout.drain()
+                        continue
+
+                    action, payload = menu.resolve_action(
+                        raw_cmd,
+                        current_page=current_page,
+                        view_mode=view_mode,
+                        search_query=search_query,
+                    )
 
                 if action == "exit":
                     bye_msg = t("gateway.bye", locale=current_locale)
@@ -699,6 +745,14 @@ class GatewayListener:
                     full_target = self.storage.get_host_by_id(host_id) if host_id else None
                     host_info = full_target or target
 
+                    # 計算目標主機在目前選單中之序號
+                    host_idx = direct_host_index if is_direct_connect and direct_host_index else None
+                    if host_idx is None:
+                        for i, h in enumerate(db_hosts, 1):
+                            if (host_id and h.get("host_id") == host_id) or (h.get("host") == host_info.get("host") and str(h.get("port", 22)) == str(host_info.get("port", 22))):
+                                host_idx = i
+                                break
+
                     term_size = process.get_terminal_size() or (80, 24)
                     term_width, term_height = term_size[0], term_size[1]
                     term_type = process.get_terminal_type() or "xterm-256color"
@@ -734,8 +788,13 @@ class GatewayListener:
                         elif "permission" in err_str.lower() or "denied" in err_str.lower():
                             diag_hint = "\r\n\033[1;33m" + t("gateway.diag_conn_denied", locale=current_locale) + "\033[0m"
 
+                        process.stdout.write(f"\r\n\033[1;31m[ERROR] {err_title}: {err}\033[0m{diag_hint}\r\n")
+                        await process.stdout.drain()
+                        if is_direct_connect:
+                            break
+
                         press_hint = t("gateway.press_any_key", locale=current_locale, default="請按任意鍵返回主選單...")
-                        process.stdout.write(f"\r\n\033[1;31m[ERROR] {err_title}: {err}\033[0m{diag_hint}\r\n\r\n{press_hint}\r\n")
+                        process.stdout.write(f"\r\n{press_hint}\r\n")
                         await process.stdout.drain()
                         await self._wait_for_any_key(process, input_state)
                         process.stdout.write("\033[2J\033[H\033[0m")
@@ -809,12 +868,13 @@ class GatewayListener:
                     else:
                         op_name = raw_display or username
                     op_dept = (user_record.get("department") if user_record else None) or host_info.get("dept", "default")
-                    target_user_val = host_info.get("default_user", "{username}").replace("{username}", username)
+                    target_user_val = target_session.target_user or host_info.get("default_user", "{username}").replace("{username}", username)
 
                     banner_ctx = BannerContext(
                         hostname=host_info.get("name") or host_info.get("host"),
                         ip=host_info.get("internal_ip") or host_info.get("host"),
                         port=int(host_info.get("port", 22)),
+                        host_index=host_idx,
                         system=sys_name,
                         dept=host_info.get("dept") or "default",
                         service_desc=host_info.get("alias"),
@@ -851,7 +911,7 @@ class GatewayListener:
                     )
                     recorder.start()
 
-                    # 5. 初始化即時指令審計防禦引擎
+                    # 5. 初始化即時指令審計防禦引擎 (注入雙軸審計主機 IP 與名稱)
                     pipe_ref: Dict[str, Optional[StreamPipe]] = {"pipe": None}
 
                     def handle_block(blocked_cmd: str) -> None:
@@ -870,6 +930,8 @@ class GatewayListener:
                         user_id=user_id,
                         username=username,
                         host_id=str(host_id or host_info.get("host")),
+                        host_ip=str(host_info.get("internal_ip") or host_info.get("host") or ""),
+                        host_name=str(host_info.get("name") or host_info.get("host") or ""),
                         on_block_action=handle_block,
                     )
 
@@ -911,6 +973,8 @@ class GatewayListener:
                         )
                         process.stdout.write(f"\r\n\033[1;32m>>> {detach_hint}\033[0m\r\n\r\n")
                         await process.stdout.drain()
+                        if is_direct_connect:
+                            break
                     else:
                         await target_session.close()
                         rec_path, rec_size, rec_sha, rec_duration = recorder.close()
@@ -926,9 +990,23 @@ class GatewayListener:
                             except Exception as save_err:
                                 logger.error("[STORAGE_ERROR] 儲存錄影元資料失敗: %s (Failed to save recording metadata: %s)", save_err, save_err)
 
-                        exit_hint = t("gateway.session_ended", locale=current_locale, default="已結束目標主機連線，正在返回選單...")
+                        if is_direct_connect:
+                            exit_hint = t(
+                                "gateway.direct_session_ended",
+                                locale=current_locale,
+                                default="已結束目標主機連線，跳板會話已正常關閉...",
+                            )
+                        else:
+                            exit_hint = t(
+                                "gateway.session_ended",
+                                locale=current_locale,
+                                default="已結束目標主機連線，正在返回選單...",
+                            )
                         process.stdout.write(f"\r\n\033[0m\033[1;33m>>> {exit_hint} [{exit_reason}]\033[0m\r\n\r\n")
                         await process.stdout.drain()
+
+                    if is_direct_connect:
+                        break
 
                     process.stdout.write("\033[2J\033[H\033[0m")
                     process.stdout.write(await render_current_menu())
@@ -937,6 +1015,22 @@ class GatewayListener:
                     invalid_msg = t("gateway.invalid_cmd", locale=current_locale)
                     process.stdout.write(f"{invalid_msg}\r\n")
                     await process.stdout.drain()
+        except Exception as client_err:
+            logger.error(
+                "[CLIENT_ERROR] 處理客戶端連線時發生未預期異常: %s (Unexpected client connection error)",
+                client_err,
+                exc_info=True,
+            )
+            try:
+                err_msg = t(
+                    "gateway.internal_error",
+                    locale=current_locale,
+                    default=f"伺服器內部異常: {client_err}",
+                )
+                process.stdout.write(f"\r\n\033[1;31m[ERROR] {err_msg}\033[0m\r\n")
+                await process.stdout.drain()
+            except Exception:
+                pass
         finally:
             await self.session_pool.close_all_for_user(username)
             self._active_connections.pop(session_id, None)

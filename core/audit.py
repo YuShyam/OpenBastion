@@ -76,6 +76,8 @@ class AuditEngine:
         user_id: str,
         username: str,
         host_id: str,
+        host_ip: str = "",
+        host_name: str = "",
         on_block_action: Optional[Callable[[str], None]] = None,
         on_alert_action: Optional[Callable[[str], None]] = None,
     ) -> None:
@@ -88,6 +90,8 @@ class AuditEngine:
         self.user_id = user_id
         self.username = username
         self.host_id = host_id
+        self.host_ip = host_ip
+        self.host_name = host_name
         self.on_block_action = on_block_action
         self.on_alert_action = on_alert_action
 
@@ -164,13 +168,15 @@ class AuditEngine:
                             logger.error("[CALLBACK_ERROR] 執行 ALERT 回呼失敗: %s (Failed to execute ALERT callback: %s)", err, err)
                     break
 
-        # 3. 追加寫入審計日誌表 (Append-Only)
+        # 3. 追加寫入審計日誌表 (Append-Only with K-Sortable audit_id)
         try:
             self.storage.log_audit_event(
                 session_id=self.session_id,
                 user_id=self.user_id,
                 username=self.username,
                 host_id=self.host_id,
+                host_ip=self.host_ip,
+                host_name=self.host_name,
                 event_type="COMMAND" if action_taken != "BLOCK" else "BLOCK",
                 command_raw=command_raw,
                 command_clean=clean_cmd,

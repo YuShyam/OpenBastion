@@ -23,6 +23,7 @@ import sqlite3
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -36,11 +37,24 @@ PBKDF2_ITERATIONS = 100_000
 
 def generate_uuid(prefix: str = "") -> str:
     """
-    生成不可預測之安全隨機 ID (杜絕 IDOR 遍歷漏洞)。
-    Generate an unpredictable cryptographically secure UUID string to prevent IDOR enumeration.
+    生成符合動靜分離與時序排序 (K-Sortable) 規範之安全隨機 ID (杜絕 IDOR 遍歷漏洞)。
+    Generate cryptographically secure IDs adhering to static/dynamic separation and K-sortable standards.
+    - 靜態資產 (host, user): 12 碼十六進位純隨機 (總長 17 碼)
+    - 動態時序 (sess, cmd): 西元 4 碼日期 + 12 碼十六進位 (總長 24~25 碼)
     """
-    raw_hex = uuid.uuid4().hex
-    return f"{prefix}_{raw_hex}" if prefix else raw_hex
+    raw_hex = uuid.uuid4().hex[:12]
+    now_date = datetime.now().strftime("%Y%m%d")
+    if prefix in ("sess", "session"):
+        return f"sess_{now_date}_{raw_hex}"
+    elif prefix in ("cmd", "audit", "command"):
+        return f"cmd_{now_date}_{raw_hex}"
+    elif prefix in ("host", "h"):
+        return f"host_{raw_hex}"
+    elif prefix in ("user", "u"):
+        return f"user_{raw_hex}"
+    elif prefix:
+        return f"{prefix}_{raw_hex}"
+    return raw_hex
 
 
 def hash_password(password: str, salt: Optional[str] = None) -> Tuple[str, str]:
@@ -175,7 +189,10 @@ class StorageProvider:
                             department_id INTEGER,
                             preferences TEXT NOT NULL DEFAULT '{}',
                             is_active INTEGER NOT NULL DEFAULT 1,
+                            created_by TEXT DEFAULT 'system',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_by TEXT DEFAULT '',
+                            updated_at TIMESTAMP,
                             FOREIGN KEY (department_id) REFERENCES departments (id)
                         );
                         """
@@ -183,13 +200,19 @@ class StorageProvider:
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_username ON users (username);")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_users_role ON users (role);")
 
-                    # 平滑遷移檢驗：若 users 表已存在但無 preferences 或 department_id 欄位，自動透過 ALTER TABLE 補齊
+                    # 平滑遷移檢驗：若 users 表已存在但無相關欄位，自動透過 ALTER TABLE 補齊
                     cur = conn.execute("PRAGMA table_info(users);")
                     cols = {row["name"] for row in cur.fetchall()}
                     if "preferences" not in cols:
                         conn.execute("ALTER TABLE users ADD COLUMN preferences TEXT NOT NULL DEFAULT '{}';")
                     if "department_id" not in cols:
                         conn.execute("ALTER TABLE users ADD COLUMN department_id INTEGER;")
+                    if "created_by" not in cols:
+                        conn.execute("ALTER TABLE users ADD COLUMN created_by TEXT DEFAULT 'system';")
+                    if "updated_by" not in cols:
+                        conn.execute("ALTER TABLE users ADD COLUMN updated_by TEXT DEFAULT '';")
+                    if "updated_at" not in cols:
+                        conn.execute("ALTER TABLE users ADD COLUMN updated_at TIMESTAMP;")
 
                     # 3. 主機資產表 (雙層 ID 防 IDOR + 78 欄位雙視圖支援 + 組織關聯)
                     conn.execute(
@@ -212,7 +235,10 @@ class StorageProvider:
                             default_user TEXT DEFAULT '{username}',
                             auth_type TEXT DEFAULT 'key',
                             credential_encrypted TEXT,
+                            created_by TEXT DEFAULT 'system',
                             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_by TEXT DEFAULT '',
+                            updated_at TIMESTAMP,
                             FOREIGN KEY (department_id) REFERENCES departments (id)
                         );
                         """
@@ -233,6 +259,12 @@ class StorageProvider:
                         conn.execute("ALTER TABLE hosts ADD COLUMN credential_encrypted TEXT;")
                     if "department_id" not in h_cols:
                         conn.execute("ALTER TABLE hosts ADD COLUMN department_id INTEGER;")
+                    if "created_by" not in h_cols:
+                        conn.execute("ALTER TABLE hosts ADD COLUMN created_by TEXT DEFAULT 'system';")
+                    if "updated_by" not in h_cols:
+                        conn.execute("ALTER TABLE hosts ADD COLUMN updated_by TEXT DEFAULT '';")
+                    if "updated_at" not in h_cols:
+                        conn.execute("ALTER TABLE hosts ADD COLUMN updated_at TIMESTAMP;")
 
                     # 4. 會話生命週期記錄表 (狀態機 + 開機孤兒對帳修復)
                     conn.execute(
@@ -253,15 +285,18 @@ class StorageProvider:
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_status ON sessions (status);")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions (user_id);")
 
-                    # 5. 僅追加審計日誌表 (Append-Only Audit Trail)
+                    # 5. 僅追加審計日誌表 (Append-Only Audit Trail with K-Sortable audit_id)
                     conn.execute(
                         """
                         CREATE TABLE IF NOT EXISTS audit_logs (
                             id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            audit_id TEXT UNIQUE,
                             session_id TEXT NOT NULL,
                             user_id TEXT NOT NULL,
                             username TEXT NOT NULL,
                             host_id TEXT NOT NULL,
+                            host_ip TEXT DEFAULT '',
+                            host_name TEXT DEFAULT '',
                             event_type TEXT NOT NULL,
                             command_raw TEXT,
                             command_clean TEXT,
@@ -274,6 +309,17 @@ class StorageProvider:
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs (user_id);")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_host ON audit_logs (host_id);")
                     conn.execute("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs (created_at);")
+
+                    # 平滑遷移檢驗：若 audit_logs 表已存在但無 audit_id / host_ip / host_name 欄位，自動補齊
+                    cur = conn.execute("PRAGMA table_info(audit_logs);")
+                    a_cols = {row["name"] for row in cur.fetchall()}
+                    if "audit_id" not in a_cols:
+                        conn.execute("ALTER TABLE audit_logs ADD COLUMN audit_id TEXT;")
+                    if "host_ip" not in a_cols:
+                        conn.execute("ALTER TABLE audit_logs ADD COLUMN host_ip TEXT DEFAULT '';")
+                    if "host_name" not in a_cols:
+                        conn.execute("ALTER TABLE audit_logs ADD COLUMN host_name TEXT DEFAULT '';")
+                    conn.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_audit_id ON audit_logs (audit_id);")
 
                     # 6. 會話錄影紀錄表 (asciinema v2 Metadata)
                     conn.execute(
@@ -308,6 +354,12 @@ class StorageProvider:
                         """
                         INSERT OR IGNORE INTO schema_version (version, description)
                         VALUES (3, 'Phase 5: departments table and zero magic defaults');
+                        """
+                    )
+                    conn.execute(
+                        """
+                        INSERT OR IGNORE INTO schema_version (version, description)
+                        VALUES (4, 'Phase 6: audit_logs audit_id/host_ip/host_name, hosts/users lifecycle metadata');
                         """
                     )
             finally:
@@ -754,6 +806,7 @@ class StorageProvider:
         default_user: str = "{username}",
         auth_type: str = "key",
         credential_encrypted: Optional[str] = None,
+        created_by: str = "system",
     ) -> Dict[str, Any]:
         """
         新增主機資產記錄 (自動生成 host_<uuid> 對外識別碼，嚴格落實零魔術預設值)。
@@ -767,6 +820,7 @@ class StorageProvider:
         dept_val = (dept or "").strip()
         group_val = (group_name or "").strip()
         status_val = (status or "offline").strip()
+        created_by_val = (created_by or "system").strip()
 
         # 若有指定部門名稱但未提供 department_id，嘗試自動掛聯
         if dept_val and department_id is None:
@@ -783,14 +837,15 @@ class StorageProvider:
                         INSERT INTO hosts (
                             host_id, name, host, port, internal_ip,
                             system, alias, rack, dept, department_id, group_name, status,
-                            provision_mode, default_user, auth_type, credential_encrypted
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                            provision_mode, default_user, auth_type, credential_encrypted,
+                            created_by
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
                             h_id, name.strip(), host.strip(), port, internal_ip_val,
                             system_val, alias_val, rack_val, dept_val, department_id,
                             group_val, status_val, provision_mode, default_user, auth_type,
-                            credential_encrypted,
+                            credential_encrypted, created_by_val,
                         ),
                     )
                 return {
@@ -810,9 +865,50 @@ class StorageProvider:
                     "default_user": default_user,
                     "auth_type": auth_type,
                     "credential_encrypted": credential_encrypted,
+                    "created_by": created_by_val,
                 }
             finally:
                 conn.close()
+
+    def get_host_by_endpoint(self, host: str, port: int = 22) -> Optional[Dict[str, Any]]:
+        """
+        依據主機端點 (host, port) 檢索主機，用於登錄前防重複唯一性檢核。
+        Query host asset record by network endpoint (host, port) for uniqueness pre-flight checks.
+        """
+        with self._lock:
+            conn = self._get_connection()
+            try:
+                cur = conn.execute(
+                    """
+                    SELECT id, host_id, name, host, port, internal_ip,
+                           system, alias, rack, dept, department_id, group_name, status,
+                           provision_mode, default_user, auth_type, credential_encrypted,
+                           created_by, created_at
+                    FROM hosts
+                    WHERE host = ? AND port = ?
+                    LIMIT 1;
+                    """,
+                    (host.strip(), int(port)),
+                )
+                row = cur.fetchone()
+                return dict(row) if row else None
+            finally:
+                conn.close()
+
+    def get_host_by_index(
+        self,
+        index: int,
+        role: str = "admin",
+        department: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        依據選單序號 (1-based index) 檢索目標主機。
+        Retrieve target host by 1-based menu index.
+        """
+        hosts = self.list_hosts(role=role, department=department)
+        if 1 <= index <= len(hosts):
+            return hosts[index - 1]
+        return None
 
     def get_host_by_id(self, host_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -938,28 +1034,34 @@ class StorageProvider:
         command_raw: Optional[str] = None,
         command_clean: Optional[str] = None,
         action_taken: str = "LOG",
-    ) -> int:
+        audit_id: Optional[str] = None,
+        host_ip: str = "",
+        host_name: str = "",
+    ) -> str:
         """
-        寫入單筆審計日誌 (Append-Only)。
-        Append a single audit event to audit_logs table.
+        寫入單筆審計日誌 (Append-Only)，自動生成時序唯一識別碼 (cmd_YYYYMMDD_<12hex>)。
+        Append a single audit event to audit_logs table with auto-generated K-sortable audit_id.
         """
+        a_id = audit_id or generate_uuid("cmd")
         with self._lock:
             conn = self._get_connection()
             try:
                 with conn:
-                    cur = conn.execute(
+                    conn.execute(
                         """
                         INSERT INTO audit_logs (
-                            session_id, user_id, username, host_id,
-                            event_type, command_raw, command_clean, action_taken
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+                            audit_id, session_id, user_id, username, host_id,
+                            host_ip, host_name, event_type, command_raw,
+                            command_clean, action_taken
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
                         """,
                         (
-                            session_id, user_id, username, host_id,
-                            event_type, command_raw, command_clean, action_taken,
+                            a_id, session_id, user_id, username, str(host_id),
+                            host_ip, host_name, event_type, command_raw,
+                            command_clean, action_taken,
                         ),
                     )
-                    return cur.lastrowid
+                return a_id
             finally:
                 conn.close()
 
@@ -967,11 +1069,12 @@ class StorageProvider:
         self,
         session_id: Optional[str] = None,
         user_id: Optional[str] = None,
+        host_id: Optional[str] = None,
         limit: int = 100,
     ) -> List[Dict[str, Any]]:
         """
-        查詢審計日誌清單，支援會話 ID 與使用者篩選。
-        Query audit events with optional session_id and user_id filtering.
+        查詢審計日誌清單，支援會話 ID、使用者與目標主機篩選。
+        Query audit events with optional session_id, user_id, and host_id filtering.
         """
         with self._lock:
             conn = self._get_connection()
@@ -984,6 +1087,10 @@ class StorageProvider:
                 if user_id:
                     query += " AND user_id = ?"
                     params.append(user_id)
+                if host_id:
+                    query += " AND (host_id = ? OR host_ip = ?)"
+                    params.append(str(host_id))
+                    params.append(str(host_id))
                 query += " ORDER BY id DESC LIMIT ?;"
                 params.append(limit)
 

@@ -80,6 +80,7 @@ class BannerContext:
     hostname: str
     ip: str
     port: int = 22
+    host_index: Optional[int] = None
     system: str = ""
     dept: str = ""
     service_desc: Optional[str] = None
@@ -155,7 +156,8 @@ class DefaultTemplateBannerProvider(IBannerProvider):
         clean_name = AnsiSanitizer.sanitize(context.hostname)
         clean_ip = AnsiSanitizer.sanitize(context.ip)
         clean_dept = AnsiSanitizer.sanitize(context.dept)
-        target_info = clean_name
+        index_prefix = f"#{context.host_index} | " if context.host_index is not None else ""
+        target_info = f"{index_prefix}{clean_name}"
         if context.service_desc and context.service_desc != context.hostname:
             clean_svc = AnsiSanitizer.sanitize(context.service_desc)
             target_info += f" [{clean_svc}]"
@@ -266,13 +268,7 @@ class DefaultTemplateBannerProvider(IBannerProvider):
             exp_str = AnsiSanitizer.sanitize(context.account_expires_at)
         lines.append(self._render_hud_item("⏳", t("banner.account_expiry", locale=loc), exp_str, loc))
 
-        # 7. 存取模式列 (方案 C：僅 JIT 動態臨時帳號時才顯示警示提示)
-        if context.provision_mode == "jit":
-            mode_desc = t("banner.mode_jit", locale=loc)
-            mode_color = "\033[1;36m"
-            lines.append(self._render_hud_item("🔐", t("banner.access_mode", locale=loc), f"{mode_color}{mode_desc}\033[0m", loc))
-
-        # 8. 特權授權列 (Sudo 權限)
+        # 7. 特權授權列 (Sudo 權限)
         if context.sudo_perms:
             priv_key = f"banner.sudo_{context.sudo_perms.lower()}"
             priv_desc = t(priv_key, locale=loc, default=context.sudo_perms)

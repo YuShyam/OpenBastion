@@ -62,7 +62,7 @@
   "banner.badge_jit": "JIT 臨時帳號",
   "banner.access_mode": "存取模式",
   "banner.mode_ca": "OpenSSH CA 短期憑證 (動態簽署，效期 300 秒)",
-  "banner.mode_jit": "JIT 獨立動態帳號 (離線自動鎖定/銷毀，密碼登入已禁用)",
+  "banner.mode_jit": "JIT 專屬帳號 (動態治理模式)",
   "banner.mode_direct": "標準協定代理 (原生目標帳號)",
   "banner.privilege": "特權授權",
   "banner.priv_inherit": "繼承目標帳號原生權限 ({target_user})",
@@ -96,6 +96,7 @@
   "gateway.conn_failed": "連線至目標主機失敗",
   "gateway.press_any_key": "請按任意鍵返回主選單...",
   "gateway.session_ended": "已結束目標主機連線，正在返回選單...",
+  "gateway.direct_session_ended": "已結束目標主機連線，跳板會話已正常關閉...",
   "gateway.session_detached": "會話已暫掛至槽位 [{slot}]，按 [r{slot}] 或 [r] 可隨時接回",
   "gateway.no_detached_session": "無可接回的暫掛會話或該槽位連線已結束",
   "gateway.security_alert_blocked": "[SECURITY ALERT] 高危險指令已被阻斷: {blocked_cmd}",
@@ -144,6 +145,11 @@
   "cli.export_ca_complete": "完成後，受控端主機即可接受 OpenBastion 簽發之短期憑證連線。\n",
   "conn_err.denied": "目標主機拒絕連線 (帳號不存在或憑證金鑰錯誤)",
   "conn_err.timeout": "連線至目標主機超時 (超過 {timeout}s): {endpoint}",
-  "conn_err.failed": "目標主機連線失敗: {error}"
+  "conn_err.failed": "目標主機連線失敗: {error}",
+  "jit.provisioning": "正在調度 JIT 帳號與 Sudoers 權限...",
+  "jit.provision_failed": "JIT 帳號動態調度失敗: {error}",
+  "jit.bootstrap_failed": "JIT 管理引導通道連線失敗: {error}",
+  "jit.rbac_applied": "已成功配置 {user} 角色權限 ({role})",
+  "cli.admin_pwd_prompt": "請輸入管理者 [{user}] 密碼以驗證權限: "
 }
 

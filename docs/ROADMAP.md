@@ -37,6 +37,16 @@
 
 ---
 
+## Phase 4.5: Level 3 JIT 帳號動態治理與全面雙軸審計體系
+- [x] 受控端零 Agent 動態調度器 (JitProvisioner，獨立 POSIX UID、密碼鎖定 Fail-Closed、/etc/sudoers.d/ 即時收放)
+- [x] 動靜分離與西元 4 碼 K-Sortable 識別碼 (host_{12hex}, user_{12hex}, sess_YYYYMMDD_{12hex}, cmd_YYYYMMDD_{12hex})
+- [x] 全面雙軸指令審計體系 (audit_logs 擴充 audit_id, host_ip, host_name 與 Enter 鍵敲擊正則脫敏落盤)
+- [x] 連線 HUD Banner 極簡化 (目標主機格式 #序號 | 名稱 (IP:Port | 部門)，徹底移除第 7 列存取模式)
+- [x] 穿透直連語法支援 (Direct Connect: ssh admin#target@bastion -p 2222，支援以 #序號、IP、名稱直達遠端)
+- [x] 資產生命週期門禁 (--add-host 預設 Level 3 JIT，管理者強鑑權門禁，端點防重複檢驗與 created_by 追蹤)
+
+---
+
 ## Phase 5: Web 監控 API 與管理介面
 - [ ] 輕量 REST API，所有數字必須來自真實採集 (Zero Mock Data)
 - [ ] 極簡灰階 Web 控制台（Shadcn UI 設計代幣體系）

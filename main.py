@@ -144,8 +144,19 @@ def handle_add_host(storage: StorageProvider, args: argparse.Namespace) -> int:
     vault = CredentialVault()
 
     print("=" * 68)
-    print("【OpenBastion 核心資產登錄】真實目標主機註冊精靈 (Add Target Host)")
+    print("【OpenBastion 核心資產登錄】目標主機註冊精靈 (Add Target Host)")
     print("=" * 68)
+
+    # 門禁 1: 管理者身分強鑑權 (Fail-Closed)
+    admin_user = getattr(args, "admin_user", None) or "admin"
+    admin_pwd = getattr(args, "admin_password", None)
+    if not admin_pwd:
+        admin_pwd = getpass.getpass(t("cli.admin_pwd_prompt", default=f"請輸入管理者 [{admin_user}] 密碼以驗證權限: ", user=admin_user)).strip()
+
+    ok, user_rec = storage.authenticate(admin_user, admin_pwd)
+    if not ok or not user_rec or user_rec.get("role") != "admin":
+        print("[SECURITY_ALERT] 管理者鑑權失敗或權限不足！操作遭到拒絕 (Authentication failed, access denied)")
+        return 1
 
     name = getattr(args, "name", None) or input("1. 請輸入主機識別名稱 (例如 Web-Node-01): ").strip()
     if not name:
@@ -161,15 +172,33 @@ def handle_add_host(storage: StorageProvider, args: argparse.Namespace) -> int:
     port_str = getattr(args, "target_port", None) or input("3. 請輸入 SSH 連線埠號 [預設 22]: ").strip()
     port = int(port_str) if port_str else 22
 
+    # 門禁 2: 端點防重複檢驗 (Duplicate Endpoint Check)
+    existing_host = storage.get_host_by_endpoint(host, port)
+    if existing_host:
+        print(f"[ERROR] 該連線端點 ({host}:{port}) 已由主機 [{existing_host['name']}] (ID: {existing_host['host_id']}) 註冊！禁止重複登錄。")
+        return 1
+
     target_user = getattr(args, "user", None) or input("4. 請輸入登入目標主機之帳號 [預設 root]: ").strip() or "root"
 
     provision_mode = getattr(args, "provision_mode", None)
     if not provision_mode:
-        mode_choice = input("5. 治理模式: [1] Level 1: 協定代理 (Direct 密碼/私鑰代管)  [2] Level 2: 憑證免密 (CA 短期憑證 300s) [預設 1]: ").strip()
-        provision_mode = "ca" if mode_choice == "2" else "direct"
+        mode_choice = input("5. 治理模式: [1] Level 1: 協定代理 (Direct 密碼/私鑰代管)  [2] Level 2: 憑證免密 (CA 短期憑證 300s)  [3] Level 3: JIT 帳號動態治理 (JIT 獨立 UID + Sudoers) [預設 3]: ").strip()
+        if mode_choice == "1":
+            provision_mode = "direct"
+        elif mode_choice == "2":
+            provision_mode = "ca"
+        else:
+            provision_mode = "jit"
 
     encrypted_cred = ""
-    if provision_mode == "ca":
+    if provision_mode == "jit":
+        auth_type = "cert"
+        # JIT 模式預設採用連線者動態帳號
+        if target_user == "root":
+            target_user = "{username}"
+        print("   [模式說明] 已選擇 Level 3 JIT 帳號動態治理模式 (JIT Dynamic Provisioning & RBAC)。")
+        print("              受控端零 Agent，連線時動態維護獨立 POSIX 帳號、鎖定密碼並即時配置 Sudoers。")
+    elif provision_mode == "ca":
         auth_type = "cert"
         print("   [模式說明] 已選擇 Level 2 憑證免密模式 (CA-Based Agentless)。")
         print("              受控端免存任何固定密碼或私鑰，連線時由 CA 自動簽發 300 秒極短期憑證。")
@@ -198,8 +227,8 @@ def handle_add_host(storage: StorageProvider, args: argparse.Namespace) -> int:
         # 使用硬體綁定金鑰加密連線憑證
         encrypted_cred = vault.encrypt(secret_raw)
 
-    step_os = "6" if provision_mode == "ca" else "8"
-    step_dept = "7" if provision_mode == "ca" else "9"
+    step_os = "6" if provision_mode in ("ca", "jit") else "8"
+    step_dept = "7" if provision_mode in ("ca", "jit") else "9"
     system_desc = (getattr(args, "target_os", None) or input(f"{step_os}. 請輸入作業系統類型 (例如 Ubuntu 22.04 / CentOS 7) [預設留空]: ").strip()) if getattr(args, "target_os", None) is None else getattr(args, "target_os", "")
     dept = (getattr(args, "dept", None) or input(f"{step_dept}. 請輸入所屬維運組/部門 [預設留空]: ").strip()) if getattr(args, "dept", None) is None else getattr(args, "dept", "")
 
@@ -215,18 +244,26 @@ def handle_add_host(storage: StorageProvider, args: argparse.Namespace) -> int:
         default_user=target_user,
         auth_type=auth_type,
         credential_encrypted=encrypted_cred,
+        created_by=admin_user,
     )
 
     print("\n" + "-" * 68)
-    if provision_mode == "ca":
-        print("✅ 真實主機註冊成功！(Level 2 憑證免密模式)")
+    if provision_mode == "jit":
+        print("✅ 目標主機註冊成功！(Level 3 JIT 帳號動態治理模式)")
+        print(f"   * 主機代碼: {host_info['host_id']}")
+        print(f"   * 連線端點: {host}:{port} (帳號: {target_user}, 模式: JIT 獨立動態帳號 + CA 短期憑證)")
+        print("   * 安全機制: 零 Agent、密碼強制鎖定 (Fail-Closed)、/etc/sudoers.d/ 動態派發")
+        print("   * 部署提醒: 請確保目標主機已將 OpenBastion CA 公鑰加入 /etc/ssh/trusted_user_ca_keys")
+        print("              (可執行 `python main.py --export-ca` 檢視完整部署指令)")
+    elif provision_mode == "ca":
+        print("✅ 目標主機註冊成功！(Level 2 憑證免密模式)")
         print(f"   * 主機代碼: {host_info['host_id']}")
         print(f"   * 連線端點: {host}:{port} (帳號: {target_user}, 模式: OpenSSH CA 短期憑證)")
         print("   * 憑證安全: 受控端免存任何固定密碼或私鑰 (Zero Stored Credentials)")
         print("   * 部署提醒: 請確保目標主機已將 OpenBastion CA 公鑰加入 /etc/ssh/trusted_user_ca_keys")
         print("              (可執行 `python main.py --export-ca` 檢視完整部署指令)")
     else:
-        print("✅ 真實主機註冊成功！(Level 1 協定代理模式)")
+        print("✅ 目標主機註冊成功！(Level 1 協定代理模式)")
         print(f"   * 主機代碼: {host_info['host_id']}")
         print(f"   * 連線端點: {host}:{port} (帳號: {target_user}, 認證: {auth_type})")
         print("   * 憑證保管: 已由 CredentialVault 加密保存 (AES-256-GCM，本機指紋衍生金鑰)")
@@ -259,9 +296,11 @@ async def main() -> None:
     parser.add_argument(
         "--provision-mode",
         type=str,
-        choices=["direct", "ca"],
-        help="治理模式 (direct: Level 1 協定代理, ca: Level 2 憑證免密)",
+        choices=["direct", "ca", "jit"],
+        help="治理模式 (direct: Level 1 協定代理, ca: Level 2 憑證免密, jit: Level 3 JIT 帳號動態治理)",
     )
+    parser.add_argument("--admin-user", type=str, default="admin", help="登錄主機之管理者帳號 (預設 admin)")
+    parser.add_argument("--admin-password", type=str, help="管理者登入密碼 (未傳入則互動輸入)")
     parser.add_argument("--auth", type=str, choices=["password", "key"], help="認證方式 (password 或 key)")
     parser.add_argument("--secret", type=str, help="認證密碼或私鑰內容")
     parser.add_argument("--target-os", type=str, help="作業系統類型 (未指定則留空)")

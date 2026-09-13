@@ -25,6 +25,7 @@ import asyncssh
 
 from core.ca import CertificateAuthorityManager
 from core.i18n import t
+from core.jit import JitProvisionError, JitProvisioner
 from core.vault import CredentialVault
 
 logger = logging.getLogger("openbastion.connector")
@@ -108,10 +109,12 @@ class TargetConnector:
         vault: Optional[CredentialVault] = None,
         ca_mgr: Optional[CertificateAuthorityManager] = None,
         storage: Optional[Any] = None,
+        jit_provisioner: Optional[JitProvisioner] = None,
     ) -> None:
         self.vault = vault or CredentialVault()
         self.storage = storage
         self.ca_mgr = ca_mgr or CertificateAuthorityManager(storage=self.storage, vault=self.vault)
+        self.jit_provisioner = jit_provisioner or JitProvisioner()
 
     @staticmethod
     def _parse_probe_output(stdout: str) -> Dict[str, Any]:
@@ -280,6 +283,246 @@ class TargetConnector:
             logger.debug("[PROBE_SKIPPED] 探針採集略過或非標準 Linux 平台: %s (Probe skipped or non-standard Linux platform: %s)", err, err)
         return {}
 
+    async def _connect_with_ca_cert(
+        self,
+        host: str,
+        port: int,
+        target_user: str,
+        login_username: str,
+        system_hint: str = "",
+        timeout: float = 10.0,
+        valid_seconds: int = 300,
+    ) -> Tuple[asyncssh.SSHClientConnection, Dict[str, Any]]:
+        """
+        使用雙軌 OpenSSH CA 短期憑證建立安全連線通道。
+        Establish secure SSH connection using dual-track short-lived OpenSSH CA certificate.
+
+        :param host: 目標主機位址 (Target host IP or FQDN)
+        :param port: 目標主機 SSH 埠號 (Target SSH port)
+        :param target_user: 登入目標之 POSIX 帳號 (Target login username)
+        :param login_username: 跳板機操作者登入帳號 (Bastion operator username)
+        :param system_hint: 作業系統特徵字串，用於演算法自適應 (OS signature string)
+        :param timeout: 連線逾時秒數 (Connection timeout in seconds)
+        :param valid_seconds: CA 憑證有效秒數 (Certificate validity in seconds)
+        :return: (連線物件, 憑證中繼資訊字典) (Tuple of connection and cert metadata)
+        """
+        if not self.ca_mgr:
+            self.ca_mgr = CertificateAuthorityManager(storage=self.storage, vault=self.vault)
+
+        # 智慧雙軌序列：CentOS 6 / RHEL 6 優先走 RSA-4096，現代主機優先走 Ed25519
+        target_sys = (system_hint or "").lower()
+        is_legacy = any(kw in target_sys for kw in ("centos 6", "centos release 6", "rhel 6", "red hat 6"))
+        algos_to_try = ["rsa", "ed25519"] if is_legacy else ["ed25519", "rsa"]
+
+        last_err: Optional[Exception] = None
+        conn: Optional[asyncssh.SSHClientConnection] = None
+        cert_info: Optional[Dict[str, Any]] = None
+
+        for attempt_idx, algo in enumerate(algos_to_try):
+            logger.info(
+                "[CA_SIGN_TRIGGER] 動態簽署 %d 秒短期憑證 (Dynamic CA signing short-lived certificate, user: %s, algo: %s, attempt: %d/%d)",
+                valid_seconds,
+                target_user,
+                algo,
+                attempt_idx + 1,
+                len(algos_to_try),
+            )
+            u_key, cert = self.ca_mgr.sign_user_certificate(
+                username=login_username,
+                principals=[target_user],
+                valid_seconds=valid_seconds,
+                algo=algo,
+            )
+            curr_cert_info = {
+                "key_id": getattr(cert, "_key_id", getattr(cert, "key_id", "")),
+                "valid_after": getattr(cert, "_valid_after", getattr(cert, "valid_after", 0)),
+                "valid_before": getattr(cert, "_valid_before", getattr(cert, "valid_before", 0)),
+                "principals": list(getattr(cert, "principals", [])),
+                "algorithm": algo,
+            }
+            connect_kwargs: Dict[str, Any] = {
+                "host": host,
+                "port": port,
+                "username": target_user,
+                "client_keys": [u_key],
+                "client_certs": [cert],
+                "known_hosts": None,
+                "kex_algs": COMPAT_KEX_ALGS,
+                "server_host_key_algs": COMPAT_HOST_KEY_ALGS,
+                "encryption_algs": COMPAT_ENCRYPTION_ALGS,
+            }
+            try:
+                logger.info(
+                    "[CONNECTING] 正在建立通道至 %s:%d (帳號: %s, 憑證: %s) (Establishing channel to %s:%d)",
+                    host,
+                    port,
+                    target_user,
+                    algo.upper(),
+                    host,
+                    port,
+                )
+                conn = await asyncio.wait_for(
+                    asyncssh.connect(**connect_kwargs),
+                    timeout=timeout,
+                )
+                cert_info = curr_cert_info
+                logger.info(
+                    "[CA_CONNECTED_OK] 成功以 %s 憑證建立連線至 %s:%d (Successfully established connection with %s cert)",
+                    algo.upper(),
+                    host,
+                    port,
+                    algo.upper(),
+                )
+                break
+            except (asyncssh.PermissionDenied, asyncssh.ProtocolError, ConnectionError, Exception) as err:
+                last_err = err
+                if attempt_idx < len(algos_to_try) - 1:
+                    logger.warning(
+                        "[CA_CASCADE_FALLBACK] 以 %s 憑證連線 %s:%d 被拒或失敗 (%s)，自動切換至下一軌演算法... (Falling back to next algorithm)",
+                        algo,
+                        host,
+                        port,
+                        err,
+                    )
+                else:
+                    logger.error(
+                        "[CA_CONNECT_EXHAUSTED] 雙軌 CA 憑證均無法連入 %s:%d: %s (Dual-track CA connection exhausted: %s)",
+                        host,
+                        port,
+                        err,
+                        err,
+                    )
+
+        if not conn:
+            if isinstance(last_err, asyncssh.PermissionDenied):
+                raise PermissionError(t("conn_err.denied", default="目標主機拒絕連線 (帳號不存在或憑證金鑰錯誤)"))
+            elif isinstance(last_err, asyncio.TimeoutError):
+                raise ConnectionError(
+                    t("conn_err.timeout", timeout=timeout, endpoint=f"{host}:{port}", default=f"連線至目標主機超時 (超過 {timeout}s): {host}:{port}")
+                )
+            else:
+                raise ConnectionError(t("conn_err.failed", error=str(last_err), default=f"目標主機連線失敗: {last_err}"))
+
+        return conn, cert_info or {}
+
+    async def _run_jit_bootstrap(
+        self,
+        host_info: Dict[str, Any],
+        login_username: str,
+        target_user: str,
+        timeout: float = 10.0,
+    ) -> None:
+        """
+        透過管理引導通道 (Bootstrap Channel) 執行 JIT 帳號建立、密碼鎖定與 RBAC 派發。
+        Execute JIT provisioning, password lock, and RBAC setup via privileged bootstrap channel.
+
+        :param host_info: 目標主機配置資料字典 (Host configuration metadata)
+        :param login_username: 跳板機操作者帳號 (Bastion operator username)
+        :param target_user: 即將建立之目標 JIT 帳號 (Target JIT username to provision)
+        :param timeout: 連線與指令逾時秒數 (Connection and execution timeout)
+        :raises ConnectionError: 當管理引導通道無法建立時 (When bootstrap connection fails)
+        :raises RuntimeError: 當 JIT 調度指令執行失敗時 (When JIT provisioning command fails)
+        """
+        host = host_info.get("host") or "127.0.0.1"
+        port = int(host_info.get("port") or 22)
+        cred_encrypted = host_info.get("credential_encrypted")
+        auth_type = host_info.get("auth_type", "password")
+        bootstrap_user = host_info.get("bootstrap_user") or "root"
+
+        logger.info(
+            "[JIT_BOOTSTRAP_START] 正在建立 JIT 管理引導通道至 %s:%d (目標帳號: %s) (Opening JIT bootstrap channel to %s:%d)",
+            host,
+            port,
+            target_user,
+            host,
+            port,
+        )
+
+        bootstrap_conn: Optional[asyncssh.SSHClientConnection] = None
+        try:
+            if cred_encrypted:
+                # 途徑 1：使用主機保險庫中託管的管理員憑證 (Host credential from vault)
+                target_password: Optional[str] = None
+                client_keys: Optional[List[Any]] = None
+                decrypted_cred = self.vault.decrypt(cred_encrypted, strict=False)
+                if decrypted_cred:
+                    if auth_type == "password":
+                        target_password = decrypted_cred
+                    elif auth_type == "key":
+                        client_keys = [asyncssh.import_private_key(decrypted_cred)]
+
+                connect_kwargs: Dict[str, Any] = {
+                    "host": host,
+                    "port": port,
+                    "username": bootstrap_user,
+                    "password": target_password,
+                    "client_keys": client_keys,
+                    "known_hosts": None,
+                    "kex_algs": COMPAT_KEX_ALGS,
+                    "server_host_key_algs": COMPAT_HOST_KEY_ALGS,
+                    "encryption_algs": COMPAT_ENCRYPTION_ALGS,
+                }
+                bootstrap_conn = await asyncio.wait_for(
+                    asyncssh.connect(**connect_kwargs),
+                    timeout=timeout,
+                )
+            else:
+                # 途徑 2：使用 Level 2 CA 發行之 60 秒 root 短期憑證 (Root short-lived CA cert)
+                bootstrap_conn, _ = await self._connect_with_ca_cert(
+                    host=host,
+                    port=port,
+                    target_user=bootstrap_user,
+                    login_username=login_username,
+                    system_hint=host_info.get("system", ""),
+                    timeout=timeout,
+                    valid_seconds=60,
+                )
+        except Exception as err:
+            logger.error(
+                "[JIT_BOOTSTRAP_FAILED] JIT 管理引導通道連線失敗: %s (JIT bootstrap channel connection failed: %s)",
+                err,
+                err,
+            )
+            raise ConnectionError(
+                t("jit.bootstrap_failed", error=str(err), default=f"JIT 管理引導通道連線失敗: {err}")
+            )
+
+        # 取得連線者之角色以派發對應 Sudoers (Fetch user role for RBAC)
+        user_role = "user"
+        if self.storage:
+            try:
+                u_rec = self.storage.get_user_by_username(login_username)
+                if u_rec and isinstance(u_rec, dict):
+                    user_role = u_rec.get("role", "user")
+            except Exception as err:
+                logger.warning(
+                    "[JIT_ROLE_QUERY_WARN] 查詢使用者角色異常，降級為預設角色 user: %s (Role query failed, defaulting to user)",
+                    err,
+                )
+
+        try:
+            # 依序執行：1. 確保帳號存在 + 2. 強制鎖定密碼 + 3. 依角色配置 Sudoers
+            custom_rule = host_info.get("custom_sudo_rule")
+            await self.jit_provisioner.ensure_jit_user(bootstrap_conn, target_user)
+            await self.jit_provisioner.configure_sudoers_rbac(
+                bootstrap_conn, target_user, user_role, custom_rule=custom_rule
+            )
+            logger.info(
+                "[JIT_PROVISION_OK] JIT 動態調度與 RBAC 派發成功 (目標: %s, 角色: %s) (JIT provisioning and RBAC success)",
+                target_user,
+                user_role,
+            )
+        except Exception as err:
+            logger.error("[JIT_PROVISION_ERROR] JIT 調度執行失敗: %s (JIT provision execution error: %s)", err, err)
+            if isinstance(err, (JitProvisionError, ValueError)):
+                raise RuntimeError(t("jit.provision_failed", error=str(err), default=f"JIT 帳號動態調度失敗: {err}"))
+            raise
+        finally:
+            try:
+                bootstrap_conn.close()
+            except Exception:
+                pass
+
     async def connect(
         self,
         host_info: Dict[str, Any],
@@ -300,91 +543,62 @@ class TargetConnector:
         auth_type = host_info.get("auth_type", "key")
         cred_encrypted = host_info.get("credential_encrypted")
 
-        # 1. 決定遠端登入帳號名稱
-        if default_user_tpl == "{username}":
-            target_user = login_username
+        # 1. 決定遠端登入帳號名稱 (JIT 模式強制隔離個人帳號，Direct/CA 模式相容共用帳號)
+        if provision_mode == "jit":
+            if not default_user_tpl or default_user_tpl in ("{username}", "root"):
+                target_user = login_username
+            elif "{username}" in default_user_tpl:
+                target_user = default_user_tpl.replace("{username}", login_username)
+            else:
+                target_user = default_user_tpl
         else:
-            target_user = default_user_tpl
+            if default_user_tpl == "{username}":
+                target_user = login_username
+            else:
+                target_user = default_user_tpl
 
         # 2. 解析並解密連線憑證 (或動態簽署雙軌 CA 短期憑證)
         target_password: Optional[str] = None
         client_keys: List[Any] = []
-        client_certs: Optional[List[Any]] = None
         cert_info: Optional[Dict[str, Any]] = None
         conn: Optional[asyncssh.SSHClientConnection] = None
 
-        if provision_mode == "ca":
-            if not self.ca_mgr:
-                self.ca_mgr = CertificateAuthorityManager(storage=self.storage, vault=self.vault)
+        if provision_mode == "jit":
+            # Level 3 JIT 動態帳號治理模式 (JIT Dynamic Provisioning & RBAC)
+            logger.info(
+                "[JIT_CONNECT_START] 開始 Level 3 JIT 動態存取流程 (使用者: %s, 目標: %s) (Starting Level 3 JIT workflow)",
+                login_username,
+                target_user,
+            )
+            # 1. 建立管理引導通道並調度帳號與 Sudoers
+            await self._run_jit_bootstrap(
+                host_info=host_info,
+                login_username=login_username,
+                target_user=target_user,
+                timeout=timeout,
+            )
+            # 2. 簽發 300 秒專屬個人短期憑證並建立正式目標連線
+            conn, cert_info = await self._connect_with_ca_cert(
+                host=host,
+                port=port,
+                target_user=target_user,
+                login_username=login_username,
+                system_hint=host_info.get("system", ""),
+                timeout=timeout,
+                valid_seconds=300,
+            )
 
-            # 智慧雙軌序列：CentOS 6 / RHEL 6 優先走 RSA-4096，現代主機優先走 Ed25519
-            target_sys = (host_info.get("system") or "").lower()
-            is_legacy = any(kw in target_sys for kw in ("centos 6", "centos release 6", "rhel 6", "red hat 6"))
-            algos_to_try = ["rsa", "ed25519"] if is_legacy else ["ed25519", "rsa"]
-
-            last_err: Optional[Exception] = None
-
-            for attempt_idx, algo in enumerate(algos_to_try):
-                logger.info(
-                    "[CA_SIGN_TRIGGER] 動態簽署 300 秒短期憑證 (Dynamic CA signing short-lived certificate, user: %s, algo: %s, attempt: %d/%d)",
-                    target_user,
-                    algo,
-                    attempt_idx + 1,
-                    len(algos_to_try),
-                )
-                u_key, cert = self.ca_mgr.sign_user_certificate(
-                    username=login_username,
-                    principals=[target_user],
-                    valid_seconds=300,
-                    algo=algo,
-                )
-                curr_cert_info = {
-                    "key_id": getattr(cert, "_key_id", getattr(cert, "key_id", "")),
-                    "valid_after": getattr(cert, "_valid_after", getattr(cert, "valid_after", 0)),
-                    "valid_before": getattr(cert, "_valid_before", getattr(cert, "valid_before", 0)),
-                    "principals": list(getattr(cert, "principals", [])),
-                    "algorithm": algo,
-                }
-                connect_kwargs: Dict[str, Any] = {
-                    "host": host,
-                    "port": port,
-                    "username": target_user,
-                    "client_keys": [u_key],
-                    "client_certs": [cert],
-                    "known_hosts": None,
-                    "kex_algs": COMPAT_KEX_ALGS,
-                    "server_host_key_algs": COMPAT_HOST_KEY_ALGS,
-                    "encryption_algs": COMPAT_ENCRYPTION_ALGS,
-                }
-                try:
-                    logger.info("[CONNECTING] 正在建立通道至 %s:%d (帳號: %s, 憑證: %s) (Establishing channel to %s:%d)", host, port, target_user, algo.upper(), host, port)
-                    conn = await asyncio.wait_for(
-                        asyncssh.connect(**connect_kwargs),
-                        timeout=timeout,
-                    )
-                    cert_info = curr_cert_info
-                    logger.info("[CA_CONNECTED_OK] 成功以 %s 憑證建立連線至 %s:%d (Successfully established connection with %s cert)", algo.upper(), host, port, algo.upper())
-                    break
-                except (asyncssh.PermissionDenied, asyncssh.ProtocolError, ConnectionError, Exception) as err:
-                    last_err = err
-                    if attempt_idx < len(algos_to_try) - 1:
-                        logger.warning(
-                            "[CA_CASCADE_FALLBACK] 以 %s 憑證連線 %s:%d 被拒或失敗 (%s)，自動切換至下一軌演算法... (Falling back to next algorithm)",
-                            algo,
-                            host,
-                            port,
-                            err,
-                        )
-                    else:
-                        logger.error("[CA_CONNECT_EXHAUSTED] 雙軌 CA 憑證均無法連入 %s:%d: %s (Dual-track CA connection exhausted: %s)", host, port, err, err)
-
-            if not conn:
-                if isinstance(last_err, asyncssh.PermissionDenied):
-                    raise PermissionError(t("conn_err.denied", default="目標主機拒絕連線 (帳號不存在或憑證金鑰錯誤)"))
-                elif isinstance(last_err, asyncio.TimeoutError):
-                    raise ConnectionError(t("conn_err.timeout", timeout=timeout, endpoint=f"{host}:{port}", default=f"連線至目標主機超時 (超過 {timeout}s): {host}:{port}"))
-                else:
-                    raise ConnectionError(t("conn_err.failed", error=str(last_err), default=f"目標主機連線失敗: {last_err}"))
+        elif provision_mode == "ca":
+            # Level 2 CA 憑證免密模式 (CA-Based Agentless)
+            conn, cert_info = await self._connect_with_ca_cert(
+                host=host,
+                port=port,
+                target_user=target_user,
+                login_username=login_username,
+                system_hint=host_info.get("system", ""),
+                timeout=timeout,
+                valid_seconds=300,
+            )
 
         else:
             # 標準 Direct 密碼/私鑰託管代理模式
