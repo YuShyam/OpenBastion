@@ -28,11 +28,12 @@
 
 ---
 
-## Phase 4: 字元水管旁路採樣、asciinema 錄影與審計落盤
-- [ ] 雙向字元串流轉發水管 (StreamPipe)
-- [ ] 旁路分流採樣 (Tap)，支援 asciinema v2 (.cast) 本地錄影
-- [ ] 登入、指令、斷線事件落盤審計日誌（Append-Only，不可覆蓋）
-- [ ] 終端帶內通知插播機制
+## Phase 4: 字元水管、會話錄影、指令審計與雙軌 CA 短期憑證
+- [x] 雙向字元串流轉發水管 (StreamPipe，含 512KB 環形緩衝與 Ctrl + ] 逃逸返回)
+- [x] 旁路分流採樣 (Tap)，支援 asciinema v2 (.cast) 本地錄影與 SHA-256 完整性校驗
+- [x] 帶內指令審計防禦引擎 (AuditEngine)，支援命令還原、機敏脫敏與三級防護 (LOG/ALERT/BLOCK)
+- [x] 動態連線 HUD Banner 卡片 (定寬標題槽垂直齊頭對齊、200ms 熔斷保護、全域 i18n)
+- [x] OpenSSH 雙軌 CA 短期憑證引擎 (Level 2 零侵入架構，Ed25519 + RSA-4096 雙軌簽發，相容早期 OpenSSH)
 
 ---
 

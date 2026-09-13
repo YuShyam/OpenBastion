@@ -8,7 +8,7 @@
 
 OpenBastion 是一套專為 Linux 與 Windows 伺服器終端管理設計的開源跳板機系統。受控主機維持原生環境，無需安裝第三方代理程式 (Agentless)。
 
-系統基於標準 RFC 4253 SSH-2.0 協定實作，提供集中身分認證、78 欄位終端防破版導航選單、操作會話生命週期管理、asciinema v2 終端錄影與不可變審計日誌。
+系統基於標準 RFC 4253 SSH-2.0 協定實作，提供集中身分認證、78 欄位終端防破版導航選單、操作會話生命週期管理、asciinema v2 終端錄影與操作審計。
 
 ---
 
@@ -33,11 +33,11 @@ OpenBastion 是一套專為 Linux 與 Windows 伺服器終端管理設計的開�
 
 各階段交付計畫請參閱 [docs/ROADMAP.md](docs/ROADMAP.md)：
 
-- [ ] **Phase 1: RFC 4253 SSH-2.0 核心通訊通道與主機金鑰管理**
-- [ ] **Phase 2: 終端 TUI 78 欄位防破版選單與 PTY 刷新保證**
-- [ ] **Phase 3: SQLite WAL 儲存驅動與會話生命週期管理器**
-- [ ] **Phase 4: 字元水管旁路採樣、asciinema 錄影與不可變審計**
-- [ ] **Phase 5: 純淨數據 Web 監控 API 與微前端管理介面**
+- [x] **Phase 1: RFC 4253 SSH-2.0 核心通訊通道與主機金鑰管理**
+- [x] **Phase 2: 終端 TUI 78 欄位防破版選單與 PTY 刷新保證**
+- [x] **Phase 3: SQLite WAL 儲存驅動與會話生命週期管理器**
+- [x] **Phase 4: 字元水管、會話錄影、指令審計與雙軌 CA 短期憑證**
+- [ ] **Phase 5: Web 監控 API 與管理介面**
 - [ ] **Phase 6: 真實 OpenSSH 端到端黑箱驗收與正式發布**
 
 ---

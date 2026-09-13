@@ -51,8 +51,8 @@ def check_os_admin_privilege() -> bool:
 
 def handle_reset_admin(storage: StorageProvider) -> int:
     """
-    執行命令列管理員密碼安全重設 (方案 B + 智慧現場雙人背書 Smart Co-Signing)。
-    Execute CLI admin password reset with TTY dynamic challenge and Smart Co-Signing.
+    執行命令列管理員密碼安全重設 (方案 B + 現場雙人覆核 Co-Signing)。
+    Execute CLI admin password reset with TTY dynamic challenge and two-person co-signing.
     """
     print("=" * 68)
     print("【OpenBastion 核心安全門禁】管理員密碼緊急重設 (Admin Password Reset)")
@@ -84,7 +84,7 @@ def handle_reset_admin(storage: StorageProvider) -> int:
         return 1
     print("[CHALLENGE_OK] 動態人機挑戰核驗通過！")
 
-    # 4. 智慧動態雙人背書判定 (Smart Co-Signing Gate)
+    # 4. 現場雙人覆核判定 (Co-Signing Gate)
     active_supervisors = storage.list_active_managers_and_admins(exclude_username="admin")
     if not active_supervisors:
         print("\n[SINGLE_OPERATOR] 檢測到系統處於初生維運階段 (除 admin 外無其他主管)。")
@@ -105,7 +105,7 @@ def handle_reset_admin(storage: StorageProvider) -> int:
         print("\n請由現場任一主管出面輸入帳號密碼完成共同簽署授權:")
         try:
             co_signer = input("授權主管帳號: ").strip()
-            co_password = getpass.getpass("授權主管密碼: ")
+            co_password = getpass.getpass(t("cli.reset_admin_cosign_prompt", default="授權主管密碼: "))
         except (EOFError, KeyboardInterrupt):
             print("\n[ABORTED] 操作已取消。")
             return 1
@@ -134,6 +134,107 @@ def handle_reset_admin(storage: StorageProvider) -> int:
         return 1
 
 
+def handle_add_host(storage: StorageProvider, args: argparse.Namespace) -> int:
+    """
+    命令列真實目標主機登錄精靈 (Interactive Real Host Enrollment Wizard)。
+    引導架構者快速登記真實主機資產與加密連線憑證。
+    """
+    from core.vault import CredentialVault
+
+    vault = CredentialVault()
+
+    print("=" * 68)
+    print("【OpenBastion 核心資產登錄】真實目標主機註冊精靈 (Add Target Host)")
+    print("=" * 68)
+
+    name = getattr(args, "name", None) or input("1. 請輸入主機識別名稱 (例如 Web-Node-01): ").strip()
+    if not name:
+        print("[ERROR] 主機名稱不可為空！")
+        return 1
+
+    raw_host = getattr(args, "target_host", None) or input("2. 請輸入目標主機 IP 或網域名稱 (例如 192.168.1.50): ").strip()
+    host = raw_host.strip("<> \t\r\n") if raw_host else ""
+    if not host:
+        print("[ERROR] 主機 IP 不可為空！")
+        return 1
+
+    port_str = getattr(args, "target_port", None) or input("3. 請輸入 SSH 連線埠號 [預設 22]: ").strip()
+    port = int(port_str) if port_str else 22
+
+    target_user = getattr(args, "user", None) or input("4. 請輸入登入目標主機之帳號 [預設 root]: ").strip() or "root"
+
+    provision_mode = getattr(args, "provision_mode", None)
+    if not provision_mode:
+        mode_choice = input("5. 治理模式: [1] Level 1: 協定代理 (Direct 密碼/私鑰代管)  [2] Level 2: 憑證免密 (CA 短期憑證 300s) [預設 1]: ").strip()
+        provision_mode = "ca" if mode_choice == "2" else "direct"
+
+    encrypted_cred = ""
+    if provision_mode == "ca":
+        auth_type = "cert"
+        print("   [模式說明] 已選擇 Level 2 憑證免密模式 (CA-Based Agentless)。")
+        print("              受控端免存任何固定密碼或私鑰，連線時由 CA 自動簽發 300 秒極短期憑證。")
+    else:
+        auth_type = getattr(args, "auth", None) or ""
+        if auth_type not in ("password", "key"):
+            choice = input("   認證類型: [1] 密碼 (Password)  [2] 私鑰 (SSH Key) [預設 1]: ").strip()
+            auth_type = "key" if choice == "2" else "password"
+
+        secret_raw = getattr(args, "secret", None)
+        if not secret_raw:
+            if auth_type == "password":
+                secret_raw = getpass.getpass(t("cli.add_host_password", default="6. 請輸入遠端登入密碼 (Password, 輸入不顯示): ")).strip()
+            else:
+                key_input = input("   請輸入私鑰路徑 (例如 id_rsa) 或直接貼上私鑰內容: ").strip()
+                if os.path.isfile(key_input):
+                    with open(key_input, "r", encoding="utf-8") as f:
+                        secret_raw = f.read().strip()
+                else:
+                    secret_raw = key_input
+
+        if not secret_raw:
+            print("[ERROR] 認證憑證不可為空！")
+            return 1
+
+        # 使用硬體綁定金鑰加密連線憑證
+        encrypted_cred = vault.encrypt(secret_raw)
+
+    step_os = "6" if provision_mode == "ca" else "8"
+    step_dept = "7" if provision_mode == "ca" else "9"
+    system_desc = (getattr(args, "target_os", None) or input(f"{step_os}. 請輸入作業系統類型 (例如 Ubuntu 22.04 / CentOS 7) [預設留空]: ").strip()) if getattr(args, "target_os", None) is None else getattr(args, "target_os", "")
+    dept = (getattr(args, "dept", None) or input(f"{step_dept}. 請輸入所屬維運組/部門 [預設留空]: ").strip()) if getattr(args, "dept", None) is None else getattr(args, "dept", "")
+
+    host_info = storage.add_host(
+        name=name,
+        host=host,
+        port=port,
+        system=system_desc or "",
+        alias="",
+        dept=dept or "",
+        status="offline",
+        provision_mode=provision_mode,
+        default_user=target_user,
+        auth_type=auth_type,
+        credential_encrypted=encrypted_cred,
+    )
+
+    print("\n" + "-" * 68)
+    if provision_mode == "ca":
+        print("✅ 真實主機註冊成功！(Level 2 憑證免密模式)")
+        print(f"   * 主機代碼: {host_info['host_id']}")
+        print(f"   * 連線端點: {host}:{port} (帳號: {target_user}, 模式: OpenSSH CA 短期憑證)")
+        print("   * 憑證安全: 受控端免存任何固定密碼或私鑰 (Zero Stored Credentials)")
+        print("   * 部署提醒: 請確保目標主機已將 OpenBastion CA 公鑰加入 /etc/ssh/trusted_user_ca_keys")
+        print("              (可執行 `python main.py --export-ca` 檢視完整部署指令)")
+    else:
+        print("✅ 真實主機註冊成功！(Level 1 協定代理模式)")
+        print(f"   * 主機代碼: {host_info['host_id']}")
+        print(f"   * 連線端點: {host}:{port} (帳號: {target_user}, 認證: {auth_type})")
+        print("   * 憑證保管: 已由 CredentialVault 加密保存 (AES-256-GCM，本機指紋衍生金鑰)")
+    print("-" * 68)
+    print("現在您可以直接執行 `python main.py`，連入 OpenBastion 選單測試畫面！\n")
+    return 0
+
+
 async def main() -> None:
     """
     主非同步通訊回環。
@@ -144,16 +245,70 @@ async def main() -> None:
     parser.add_argument(
         "--reset-admin",
         action="store_true",
-        help="啟動管理員密碼緊急安全重設流程 (方案 B + 智慧雙人背書)",
+        help="啟動管理員密碼緊急安全重設流程 (方案 B + 現場雙人覆核)",
+    )
+    parser.add_argument(
+        "--add-host",
+        action="store_true",
+        help="啟動真實目標主機互動式註冊精靈 (Interactive Target Host Enrollment)",
+    )
+    parser.add_argument("--name", type=str, help="主機識別名稱 (例如 Web-01)")
+    parser.add_argument("--target-host", type=str, help="目標主機 IP 或域名")
+    parser.add_argument("--target-port", type=str, help="目標 SSH 埠號 (預設 22)")
+    parser.add_argument("--user", type=str, help="目標登入帳號 (預設 root)")
+    parser.add_argument(
+        "--provision-mode",
+        type=str,
+        choices=["direct", "ca"],
+        help="治理模式 (direct: Level 1 協定代理, ca: Level 2 憑證免密)",
+    )
+    parser.add_argument("--auth", type=str, choices=["password", "key"], help="認證方式 (password 或 key)")
+    parser.add_argument("--secret", type=str, help="認證密碼或私鑰內容")
+    parser.add_argument("--target-os", type=str, help="作業系統類型 (未指定則留空)")
+    parser.add_argument("--dept", type=str, help="所屬維運組/部門 (未指定則留空)")
+    parser.add_argument(
+        "--export-ca",
+        action="store_true",
+        help="匯出 OpenSSH CA 根公鑰與目標主機配置指引 (Export OpenSSH CA public key)",
     )
     args = parser.parse_args()
 
     # 1. 初始化 SQLite WAL 儲存驅動
     storage = StorageProvider()
 
+    # 若帶有 --export-ca 參數，輸出 CA 根公鑰與部署指引後退出
+    if args.export_ca:
+        from core.ca import CertificateAuthorityManager
+        from core.vault import CredentialVault
+
+        vault = CredentialVault()
+        ca_mgr = CertificateAuthorityManager(storage=storage, vault=vault)
+        ca_keys = ca_mgr.get_ca_public_keys()
+        enroll_cmd = ca_mgr.get_enroll_command()
+
+        print("=" * 72)
+        print(t("cli.export_ca_header", default="【OpenBastion】雙軌 OpenSSH CA 根公鑰與自適應部署指引 (Dual-CA Setup)"))
+        print("=" * 72)
+        print("\n" + t("cli.export_ca_pub_keys", default="1. 雙軌 OpenSSH CA 根公鑰 (Dual CA Public Keys):"))
+        print(t("cli.export_ca_track1", default="   [軌道 1: 現代主機 (Ed25519 - 128-bit 強度)]:"))
+        print(f"   {ca_keys['ed25519']}")
+        print("\n" + t("cli.export_ca_track2", default="   [軌道 2: 遺留相容 (RSA-4096 高強度金鑰)]:"))
+        print(f"   {ca_keys['rsa']}")
+        print("\n" + t("cli.export_ca_cmd_title", default="2. 目標主機一鍵自適應部署指令 (All-in-One Adaptive Shell Command):"))
+        print(t("cli.export_ca_cmd_desc", default="   * 說明：在受控端目標主機（相容 CentOS 6 至現代 Linux）貼上下方單行指令，\n          腳本將透過 `ssh -V` 自動識別版本，並完成公鑰寫入、sshd_config 配置與平滑重載：\n"))
+        print(f"   {enroll_cmd}\n")
+        print("=" * 72)
+        print(t("cli.export_ca_complete", default="完成後，受控端主機即可接受 OpenBastion 簽發之短期憑證連線。\n"))
+        sys.exit(0)
+
     # 若帶有 --reset-admin 參數，執行重設流程後退出
     if args.reset_admin:
         exit_code = handle_reset_admin(storage)
+        sys.exit(exit_code)
+
+    # 若帶有 --add-host 參數，啟動註冊精靈後退出
+    if args.add_host:
+        exit_code = handle_add_host(storage, args)
         sys.exit(exit_code)
 
     logger.info("[BOOT_OK] SQLite WAL 儲存驅動已就緒: %s (SQLite WAL storage driver initialized)", storage.db_path)
@@ -185,9 +340,15 @@ async def main() -> None:
         while True:
             await asyncio.sleep(3600)
     except (asyncio.CancelledError, KeyboardInterrupt):
-        logger.info("[SHUTDOWN_SIGNAL] 接收到終止信號，正在安全關閉服務... (Termination signal received, shutting down...)")
-    finally:
-        await gateway.stop()
+        logger.info("[SHUTDOWN_SIGNAL] 接收到終止訊號，正在關閉服務（等待 30 秒倒數，再次按下 Ctrl + C 可立即強制結束）(Termination signal received, shutting down...)")
+        try:
+            await gateway.stop(timeout=30.0, force=False)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            logger.warning("[FORCE_SHUTDOWN] 再次接收到 Ctrl + C，立即強制結束服務 (Second Ctrl + C received, forcing immediate exit)")
+            await gateway.stop(timeout=0.0, force=True)
+    except Exception as exc:
+        logger.error("[UNEXPECTED_ERROR] 服務異常中斷: %s (Service interrupted unexpectedly: %s)", exc, exc)
+        await gateway.stop(timeout=0.0, force=True)
 
 
 if __name__ == "__main__":
