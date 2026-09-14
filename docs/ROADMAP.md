@@ -47,6 +47,16 @@
 
 ---
 
+## Phase 4.8: RFC 4256 鍵盤互動 MFA 與可抽換 SPI 插件架構
+- [x] 認證解耦 SPI 介面 (IAuthProvider / IMfaProvider)，支援純標準函式庫可擴充外掛
+- [x] 純 Python 原生 RFC 6238 TOTP 計算與驗證引擎 (90 秒容錯窗口與單次消費防重放)
+- [x] 一次性緊急備援碼 (Recovery Codes) 加鹽雜湊持久化與即時核銷
+- [x] RFC 4256 鍵盤互動二階瀑布流狀態機 (先驗密碼，未開 MFA 者自動平滑放行)
+- [x] RFC 4252 標準認證橫幅通道 (send_auth_banner 靠左對齊，杜絕 Windows OpenSSH 轉義亂碼)
+- [x] CLI 參數全面中英雙語化與 MFA 本機安全門禁 (強制管理者鑑權與操作審計留痕)
+
+---
+
 ## Phase 5: Web 監控 API 與管理介面
 - [ ] 輕量 REST API，所有數字必須來自真實採集 (Zero Mock Data)
 - [ ] 極簡灰階 Web 控制台（Shadcn UI 設計代幣體系）

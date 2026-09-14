@@ -150,6 +150,23 @@
   "jit.provision_failed": "JIT provisioning failed: {error}",
   "jit.bootstrap_failed": "JIT bootstrap channel connection failed: {error}",
   "jit.rbac_applied": "Successfully configured {user} RBAC rules ({role})",
-  "cli.admin_pwd_prompt": "Please enter password for administrator [{user}] to verify privileges: "
+  "cli.admin_pwd_prompt": "Please enter password for administrator [{user}] to verify privileges: ",
+  "cli.auth_denied": "[SECURITY_ALERT] Administrator authentication failed or insufficient privileges! Operation denied.",
+  "cli.mfa_setup_title": "[OpenBastion Access Control] MFA Setup: {username}",
+  "cli.mfa_disable_title": "[OpenBastion Access Control] Disable MFA: {username}",
+  "cli.mfa_user_not_found": "[ERROR] User '{username}' not found! Please check username.",
+  "cli.mfa_db_error": "[ERROR] Database update failed, operation aborted!",
+  "cli.mfa_setup_success": "[OK] User '{username}' (ID: {user_id}) has successfully enabled MFA authentication!\n",
+  "cli.mfa_disable_success": "[OK] User '{username}' (ID: {user_id}) has disabled MFA and reverted to password mode.\n",
+  "cli.mfa_already_disabled": "[NOTICE] User '{username}' does not have MFA enabled.",
+  "cli.mfa_scan_qr": "[Mobile] Scan the QR Code below with Google Authenticator or 1Password:\n",
+  "cli.mfa_guide_header": "[Guide] Authenticator Binding Guide:",
+  "cli.mfa_guide_secret": "   * Base32 Secret Key: \u001b[1;36m{secret}\u001b[0m",
+  "cli.mfa_guide_uri": "   * Standard URI: \u001b[33m{uri}\u001b[0m",
+  "cli.mfa_guide_qr_hint": "   * QR Code Hint: Run `pip install qrcode` to render ASCII QR Code directly in terminal.\n",
+  "cli.mfa_recovery_title": "[Recovery] One-Time Recovery Codes:",
+  "cli.mfa_recovery_desc1": "   Note: If your authenticator is lost or unavailable, use recovery codes to log in.",
+  "cli.mfa_recovery_desc2": "         Each recovery code can only be used once and expires immediately.\n",
+  "cli.mfa_save_hint": "Please save your secret key and recovery codes in a secure location.\n"
 }
 

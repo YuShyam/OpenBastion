@@ -150,6 +150,23 @@
   "jit.provision_failed": "JIT 帳號動態調度失敗: {error}",
   "jit.bootstrap_failed": "JIT 管理引導通道連線失敗: {error}",
   "jit.rbac_applied": "已成功配置 {user} 角色權限 ({role})",
-  "cli.admin_pwd_prompt": "請輸入管理者 [{user}] 密碼以驗證權限: "
+  "cli.admin_pwd_prompt": "請輸入管理者 [{user}] 密碼以驗證權限: ",
+  "cli.auth_denied": "[SECURITY_ALERT] 管理者鑑權失敗或權限不足！操作遭到拒絕 (Authentication failed, access denied)",
+  "cli.mfa_setup_title": "【OpenBastion 身分安全門禁】MFA 雙因子驗證設定 (Setup MFA: {username})",
+  "cli.mfa_disable_title": "【OpenBastion 身分安全門禁】MFA 雙因子驗證停用 (Disable MFA: {username})",
+  "cli.mfa_user_not_found": "[ERROR] 查無使用者 '{username}'！請先確認帳號名稱是否正確。",
+  "cli.mfa_db_error": "[ERROR] 資料庫更新失敗，操作未完成！",
+  "cli.mfa_setup_success": "[成功] 使用者 '{username}' (ID: {user_id}) 已成功啟用 MFA 雙因子驗證！\n",
+  "cli.mfa_disable_success": "[成功] 使用者 '{username}' (ID: {user_id}) 已成功停用 MFA，恢復為純密碼登入模式。\n",
+  "cli.mfa_already_disabled": "[提示] 使用者 '{username}' 本就未啟用 MFA 雙因子驗證。",
+  "cli.mfa_scan_qr": "[行動裝置] 請使用 Google Authenticator / 1Password 掃描下方 QR Code 綁定：\n",
+  "cli.mfa_guide_header": "[配置指引] 手機 Authenticator 綁定指引 (Authenticator Binding Guide):",
+  "cli.mfa_guide_secret": "   * 手動輸入金鑰 (Base32 Secret): \u001b[1;36m{secret}\u001b[0m",
+  "cli.mfa_guide_uri": "   * 標準 URI (可直接貼入或自行轉碼): \u001b[33m{uri}\u001b[0m",
+  "cli.mfa_guide_qr_hint": "   * 終端圖形提醒: 執行 `pip install qrcode` 後可直接於終端機顯示 ASCII QR Code。\n",
+  "cli.mfa_recovery_title": "[安全備援] 一次性備援碼 (Recovery Codes):",
+  "cli.mfa_recovery_desc1": "   說明: 手機遺失、沒電或無法讀取動態碼時，可輸入以下備援碼登入。",
+  "cli.mfa_recovery_desc2": "         每組備援碼僅限使用一次，使用後即刻失效。\n",
+  "cli.mfa_save_hint": "請妥善保存上述密鑰與備援碼。\n"
 }
 

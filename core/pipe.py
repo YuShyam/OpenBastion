@@ -15,6 +15,7 @@ OpenBastion 核心 - 雙向字元串流水管與斷線接回引擎 (StreamPipe &
 import asyncio
 import collections
 import logging
+import time
 from typing import Any, Awaitable, Callable, Deque, Optional, Union
 
 import asyncssh
@@ -23,6 +24,57 @@ logger = logging.getLogger("openbastion.pipe")
 
 DEFAULT_RING_BUFFER_BYTES = 512 * 1024  # 512KB 環形重繪緩衝區
 ESCAPE_KEY_CTRL_BRACKET = b"\x1d"  # Ctrl + ] 預設逃逸鍵 (RFC / Telnet 標準)
+
+
+def parse_escape_key(key_repr: Optional[Union[str, bytes]]) -> bytes:
+    """
+    解析逃逸鍵字串或位元組為標準單字節 ASCII 控制碼。
+    Parse escape key representation string or bytes into single-byte ASCII control code.
+
+    支援格式 / Supported formats:
+        - "ctrl_]" | "ctrl-]" | "^]" -> b"\x1d" (預設)
+        - "ctrl_\\" | "ctrl-\\" | "^\\" -> b"\x1c"
+        - "ctrl_~" | "ctrl-~" | "^~" | "^^" -> b"\x1e"
+        - "ctrl_@" | "ctrl-@" | "^@" -> b"\x00"
+        - "ctrl_a".."ctrl_z" | "^a".."^z" -> b"\x01"..b"\x1a"
+        - 原始 bytes (長度 1)
+    """
+    if isinstance(key_repr, bytes) and len(key_repr) == 1:
+        return key_repr
+    if not key_repr or not isinstance(key_repr, str):
+        return ESCAPE_KEY_CTRL_BRACKET
+
+    k = key_repr.strip().lower()
+    mapping = {
+        "ctrl_]": b"\x1d",
+        "ctrl-]": b"\x1d",
+        "^]": b"\x1d",
+        "ctrl_\\": b"\x1c",
+        "ctrl-\\": b"\x1c",
+        "^\\": b"\x1c",
+        "ctrl_~": b"\x1e",
+        "ctrl-~": b"\x1e",
+        "^~": b"\x1e",
+        "^^": b"\x1e",
+        "ctrl_@": b"\x00",
+        "ctrl-@": b"\x00",
+        "^@": b"\x00",
+        "0x1d": b"\x1d",
+        "\\x1d": b"\x1d",
+        "0x1c": b"\x1c",
+        "\\x1c": b"\x1c",
+    }
+    if k in mapping:
+        return mapping[k]
+
+    import re
+    m = re.match(r"^(?:ctrl[_\-]|(?:\^))([a-z])$", k)
+    if m:
+        char = m.group(1)
+        ascii_val = ord(char) - ord("a") + 1
+        return bytes([ascii_val])
+
+    return ESCAPE_KEY_CTRL_BRACKET
 
 
 class RingBuffer:
@@ -87,10 +139,27 @@ class StreamPipe:
         on_escape: Optional[Callable[[], None]] = None,
         buffer_size: int = DEFAULT_RING_BUFFER_BYTES,
         target_process: Optional[Any] = None,
+        max_ttl_seconds: int = 480 * 60,
+        idle_timeout_seconds: int = 15 * 60,
+        escape_key: Union[str, bytes] = ESCAPE_KEY_CTRL_BRACKET,
     ) -> None:
         """
-        初始化字元水管實例。
-        Initialize stream pipe instance with I/O streams and callbacks.
+        初始化字元水管實例 (配置雙向流、環形重繪區與雙軌時效看門狗)。
+        Initialize stream pipe instance with I/O streams, callbacks, and dual-TTL watchdog.
+
+        參數 / Args:
+            client_reader: 客戶端輸入字元讀取流
+            client_writer: 客戶端終端輸出寫入流
+            target_reader: 目標主機 PTY 輸出讀取流
+            target_writer: 目標主機 PTY 輸入寫入流
+            on_input: 輸入字元採樣回調 (非同步推送錄影與審計)
+            on_output: 輸出字元採樣回調 (推送錄影)
+            on_escape: 偵測到逃逸按鍵時之回調
+            buffer_size: 環形緩衝區大小 (預設 512KB)
+            target_process: 目標端遠端進程實體 (支援終端大小自動重繪)
+            max_ttl_seconds: 單次連線最大時效秒數 (0 代表無上限)
+            idle_timeout_seconds: 閒置連續無操作中斷秒數 (0 代表無上限)
+            escape_key: 脫離目標終端之逃逸按鍵 (預設 Ctrl + ])
         """
         self.client_reader = client_reader
         self.client_writer = client_writer
@@ -103,42 +172,60 @@ class StreamPipe:
         self.on_escape = on_escape
 
         self.ring_buffer = RingBuffer(max_bytes=buffer_size)
+        self.max_ttl_seconds = max_ttl_seconds
+        self.idle_timeout_seconds = idle_timeout_seconds
+        self.escape_key = parse_escape_key(escape_key)
+
         self._is_running = False
         self._stop_event = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
         self._write_lock = asyncio.Lock()
 
+        self._start_time: float = 0.0
+        self._last_active_time: float = 0.0
+        self._watchdog_exit_reason: Optional[str] = None
+        self._warned_5m = False
+        self._warned_1m = False
+
     async def run(self) -> str:
         """
-        啟動雙向字元轉發，等待任意一方結束或使用者按下逃逸鍵。
-        Start bidirectional character pumping, waiting for termination or escape key.
-        回傳退出原因：'escape'、'target_closed'、'client_closed'、'error'。
+        啟動雙向字元轉發與時效看門狗，等待任意一方結束、逾時或使用者按下逃逸鍵。
+        Start bidirectional pumping and watchdog, waiting for termination, timeout, or escape.
+        回傳退出原因：'escape'、'idle_timeout'、'max_ttl_expired'、'target_closed'、'client_closed'、'normal'。
         """
         self._is_running = True
         self._stop_event.clear()
+        now = time.monotonic()
+        self._start_time = now
+        self._last_active_time = now
+        self._watchdog_exit_reason = None
+        self._warned_5m = False
+        self._warned_1m = False
 
         task_c2t = asyncio.create_task(self._pump_client_to_target(), name="pipe_c2t")
         task_t2c = asyncio.create_task(self._pump_target_to_client(), name="pipe_t2c")
         task_stop = asyncio.create_task(self._stop_event.wait(), name="pipe_stop")
-        self._tasks = [task_c2t, task_t2c, task_stop]
+        task_watchdog = asyncio.create_task(self._watchdog_loop(), name="pipe_watchdog")
+        self._tasks = [task_c2t, task_t2c, task_stop, task_watchdog]
 
-        # 等待停止信號或任一幫浦結束
+        # 等待停止信號、任一幫浦結束或看門狗逾時
         done, pending = await asyncio.wait(
-            [task_stop, task_c2t, task_t2c],
+            [task_stop, task_c2t, task_t2c, task_watchdog],
             return_when=asyncio.FIRST_COMPLETED,
         )
 
-        exit_reason = "normal"
-        if task_c2t.done() and not task_c2t.cancelled():
-            res = task_c2t.result()
-            if res == "escape":
-                exit_reason = "escape"
-            elif res == "client_eof":
-                exit_reason = "client_closed"
-        if task_t2c.done() and not task_t2c.cancelled() and exit_reason == "normal":
-            exit_reason = "target_closed"
+        exit_reason = self._watchdog_exit_reason or "normal"
+        if not self._watchdog_exit_reason:
+            if task_c2t.done() and not task_c2t.cancelled():
+                res = task_c2t.result()
+                if res == "escape":
+                    exit_reason = "escape"
+                elif res == "client_eof":
+                    exit_reason = "client_closed"
+            if task_t2c.done() and not task_t2c.cancelled() and exit_reason == "normal":
+                exit_reason = "target_closed"
 
-        # 安全終止尚未結束的非同步幫浦
+        # 安全終止尚未結束的非同步協程
         self._is_running = False
         for t in pending:
             t.cancel()
@@ -189,11 +276,13 @@ class StreamPipe:
                 if not data:
                     return "client_eof"
 
+                # 收到使用者鍵盤敲擊，重設閒置活躍時間戳記
+                self._last_active_time = time.monotonic()
                 raw_bytes = data.encode("utf-8") if isinstance(data, str) else data
 
-                # 偵測 Ctrl + ] 逃逸組合鍵
-                if ESCAPE_KEY_CTRL_BRACKET in raw_bytes:
-                    logger.info("[ESCAPE_TRIGGERED] 偵測到連線者按下 Ctrl + ] 逃逸鍵，請求返回跳板機選單 (Escape key Ctrl+] triggered, returning to menu)")
+                # 偵測逃逸組合鍵
+                if self.escape_key in raw_bytes:
+                    logger.info("[ESCAPE_TRIGGERED] 偵測到連線者按下逃逸鍵，請求返回跳板機選單 (Escape key triggered, returning to menu)")
                     if self.on_escape:
                         try:
                             self.on_escape()
@@ -258,6 +347,70 @@ class StreamPipe:
         except Exception as err:
             logger.debug("[PUMP_CLOSED] 目標端輸出幫浦關閉: %s (Target output pump closed: %s)", err, err)
         return "target_done"
+
+    async def _watchdog_loop(self) -> str:
+        """
+        時效看門狗協程：即時監控會話生命週期硬上限與閒置超時。
+        Session lifecycle watchdog monitoring max TTL and idle timeout.
+        """
+        try:
+            while self._is_running:
+                await asyncio.sleep(0.5)
+                now = time.monotonic()
+
+                # 1. 閒置超時看門狗 (Idle Watchdog)
+                if self.idle_timeout_seconds > 0:
+                    idle_elapsed = now - self._last_active_time
+                    if idle_elapsed >= self.idle_timeout_seconds:
+                        idle_mins = int(self.idle_timeout_seconds // 60) or 1
+                        warn_msg = f"\r\n\033[1;31m[TIMEOUT] 連線已連續閒置超過 {idle_mins} 分鐘，系統已主動安全中斷連線 (Idle timeout reached, session disconnected)\033[0m\r\n"
+                        await self.inject_inband_message(warn_msg)
+                        logger.warning(
+                            "[IDLE_TIMEOUT] 連線連續閒置 %d 秒，達到上限 %d 秒，觸發主動斷線 (Idle timeout triggered)",
+                            int(idle_elapsed),
+                            self.idle_timeout_seconds,
+                        )
+                        self._watchdog_exit_reason = "idle_timeout"
+                        self.stop()
+                        return "idle_timeout"
+
+                # 2. 單次會話生命週期硬上限 (Max Session TTL)
+                if self.max_ttl_seconds > 0:
+                    total_elapsed = now - self._start_time
+                    remaining = self.max_ttl_seconds - total_elapsed
+
+                    # 到期前 5 分鐘廣播提醒 (若總上限大於 5 分鐘且尚未廣播過)
+                    if remaining <= 300 and remaining > 60 and not self._warned_5m and self.max_ttl_seconds > 300:
+                        self._warned_5m = True
+                        warn_msg = "\r\n\033[1;33m[系統通知] 本次連線將在 5 分鐘後達到時效硬上限，請儘速存檔並準備結束作業 (Session will reach max TTL in 5 mins)\033[0m\r\n"
+                        await self.inject_inband_message(warn_msg)
+                        logger.info("[TTL_WARN_5M] 發送 5 分鐘到期倒數廣播通知 (Sent 5-minute TTL warning broadcast)")
+
+                    # 到期前 1 分鐘廣播提醒
+                    if remaining <= 60 and remaining > 0 and not self._warned_1m and self.max_ttl_seconds > 60:
+                        self._warned_1m = True
+                        warn_msg = "\r\n\033[1;33m[系統通知] 本次連線將在 1 分鐘後達到時效硬上限，連線即將強制中斷 (Session will terminate in 1 min)\033[0m\r\n"
+                        await self.inject_inband_message(warn_msg)
+                        logger.info("[TTL_WARN_1M] 發送 1 分鐘到期倒數廣播通知 (Sent 1-minute TTL warning broadcast)")
+
+                    # 達到硬上限強制終止
+                    if total_elapsed >= self.max_ttl_seconds:
+                        ttl_hours = round(self.max_ttl_seconds / 3600, 1)
+                        warn_msg = f"\r\n\033[1;31m[TTL_EXPIRED] 本次連線已達到單次會話生命週期硬上限 ({ttl_hours} 小時)，系統已強制切斷 (Max session TTL reached, session terminated)\033[0m\r\n"
+                        await self.inject_inband_message(warn_msg)
+                        logger.warning(
+                            "[MAX_TTL_EXPIRED] 連線累計時長 %d 秒，達到硬上限 %d 秒，強制切斷連線 (Max session TTL expired)",
+                            int(total_elapsed),
+                            self.max_ttl_seconds,
+                        )
+                        self._watchdog_exit_reason = "max_ttl_expired"
+                        self.stop()
+                        return "max_ttl_expired"
+        except asyncio.CancelledError:
+            pass
+        except Exception as err:
+            logger.debug("[WATCHDOG_ERR] 看門狗協程異常退出: %s (Watchdog loop error: %s)", err, err)
+        return "watchdog_done"
 
     async def inject_inband_message(self, message: str) -> None:
         """

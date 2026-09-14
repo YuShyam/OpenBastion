@@ -305,3 +305,93 @@ class JitProvisioner:
 
         return inactive_users
 
+    async def schedule_autonomous_self_lock(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        target_user: str,
+        session_id: str,
+        ttl_minutes: int,
+    ) -> bool:
+        """
+        在目標 Linux 主機植入第 0 秒自主定時自毀排程 (Target-side Autonomous Self-Lock)。
+        Schedule autonomous pre-emptive account lockout unit on target host at connect time.
+
+        設計準則 / Architecture Principle:
+            - 防範但不禁止：若管理者/部門將 ttl_minutes 設定為 0 (無上限)，
+              系統完全尊重設定人意志，不植入定時器，允許無限時操作。
+            - 若 ttl_minutes > 0，則定時時間為 ttl_minutes + 5 分鐘緩衝，
+              優先調用 systemd-run 暫態定時單元，降級使用 at 指令。
+
+        參數 / Args:
+            conn: 具備特權之管理 SSH 通道
+            target_user: 待鎖定之目標使用者名稱
+            session_id: 當前會話 ID
+            ttl_minutes: 本次會話之時效上限 (分鐘)
+
+        回傳 / Returns:
+            若成功執行或依政策跳過回傳 True。
+        """
+        # 1. 人為設定無上限 (防範但不禁止原則)
+        if ttl_minutes <= 0:
+            logger.info(
+                "[JIT_AUTONOMOUS_LOCK_SKIPPED] 部門/管理者策略設定為無上限 (ttl=%d)，跳過目標端自主定時自毀 (Skipping autonomous lock: unlimited)",
+                ttl_minutes,
+            )
+            return True
+
+        user = self.validate_username(target_user)
+        quoted_user = shlex.quote(user)
+        clean_id = re.sub(r"[^a-zA-Z0-9_\-]", "", session_id)
+        lock_minutes = ttl_minutes + 5  # 寬限緩衝 5 分鐘，給跳板機正常退場留餘裕
+
+        # 優先使用 systemd-run 暫態定時器，舊系統降級為 at 指令
+        cmd = (
+            f"(which systemd-run >/dev/null 2>&1 && "
+            f"systemd-run --unit=bastion-lock-{clean_id} --on-active={lock_minutes}m /usr/sbin/usermod -L {quoted_user} 2>/dev/null) || "
+            f"(echo '/usr/sbin/usermod -L {quoted_user}' | at now + {lock_minutes} minutes 2>/dev/null) || true"
+        )
+        try:
+            res = await asyncio.wait_for(conn.run(cmd), timeout=self.command_timeout)
+            logger.info(
+                "[JIT_AUTONOMOUS_LOCK_SCHEDULED] 目標端已成功預約自主鎖定單元: bastion-lock-%s (%d 分鐘後觸發) (Scheduled autonomous lock: in %d mins)",
+                clean_id,
+                lock_minutes,
+                lock_minutes,
+            )
+            return True
+        except Exception as err:
+            logger.warning(
+                "[JIT_AUTONOMOUS_LOCK_WARN] 目標端預約自主鎖定失敗 (非致命): %s (Warning scheduling autonomous lock)",
+                err,
+            )
+            return False
+
+    async def cancel_autonomous_self_lock(
+        self,
+        conn: asyncssh.SSHClientConnection,
+        session_id: str,
+    ) -> bool:
+        """
+        會話正常結束時，清除目標主機上預約之自主鎖定定時單元。
+        Cancel scheduled autonomous lock timer unit on target host upon graceful teardown.
+
+        參數 / Args:
+            conn: 具備特權之管理 SSH 通道
+            session_id: 當前會話 ID
+
+        回傳 / Returns:
+            執行成功回傳 True。
+        """
+        clean_id = re.sub(r"[^a-zA-Z0-9_\-]", "", session_id)
+        cmd = f"systemctl stop bastion-lock-{clean_id}.timer 2>/dev/null || true"
+        try:
+            await asyncio.wait_for(conn.run(cmd), timeout=self.command_timeout)
+            logger.info(
+                "[JIT_AUTONOMOUS_LOCK_CANCELLED] 已註銷目標主機自主定時器單元: bastion-lock-%s (Cancelled autonomous lock timer)",
+                clean_id,
+            )
+            return True
+        except Exception as err:
+            logger.debug("[JIT_LOCK_CANCEL_WARN] 清理自主鎖定定時器時發生警告: %s (Warning cancelling timer: %s)", err, err)
+            return False
+

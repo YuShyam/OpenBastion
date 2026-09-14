@@ -80,12 +80,34 @@ class TargetSession:
     probe_data: Dict[str, Any] = field(default_factory=dict)
     provision_mode: str = "direct"
     cert_info: Optional[Dict[str, Any]] = None
+    session_id: Optional[str] = None
+    host_id: Optional[str] = None
+    storage: Optional[Any] = None
+    jit_provisioner: Optional[JitProvisioner] = None
+    ttl_minutes: int = 0
 
     async def close(self) -> None:
         """
-        正常關閉目標連線與進程。
-        Close target SSH connection and remote client process gracefully.
+        正常關閉目標連線與進程，並結清延遲補償佇列任務。
+        Close target SSH connection and process gracefully, resolving pending cleanup task.
         """
+        # 1. 補償佇列消帳 (若該會話曾登記 pending_cleanups)
+        if self.session_id and self.storage:
+            try:
+                self.storage.resolve_cleanup(self.session_id)
+                logger.info(
+                    "[CLEANUP_RESOLVED] 會話 [ID: %s] 正常離線，補償佇列已消帳 (Session closed, cleanup resolved)",
+                    self.session_id,
+                )
+            except Exception as err:
+                logger.warning(
+                    "[CLEANUP_RESOLVE_WARN] 會話 [ID: %s] 補償佇列消帳異常: %s (Warning resolving cleanup: %s)",
+                    self.session_id,
+                    err,
+                    err,
+                )
+
+        # 2. 正常關閉遠端進程與連線
         try:
             if not self.process.is_closing():
                 self.process.close()
@@ -411,6 +433,8 @@ class TargetConnector:
         login_username: str,
         target_user: str,
         timeout: float = 10.0,
+        session_id: Optional[str] = None,
+        ttl_minutes: int = 0,
     ) -> None:
         """
         透過管理引導通道 (Bootstrap Channel) 執行 JIT 帳號建立、密碼鎖定與 RBAC 派發。
@@ -420,6 +444,8 @@ class TargetConnector:
         :param login_username: 跳板機操作者帳號 (Bastion operator username)
         :param target_user: 即將建立之目標 JIT 帳號 (Target JIT username to provision)
         :param timeout: 連線與指令逾時秒數 (Connection and execution timeout)
+        :param session_id: 當前連線會話 ID (Current session ID for cleanup tracking)
+        :param ttl_minutes: 本次會話時效上限分鐘數 (Session TTL limit in minutes)
         :raises ConnectionError: 當管理引導通道無法建立時 (When bootstrap connection fails)
         :raises RuntimeError: 當 JIT 調度指令執行失敗時 (When JIT provisioning command fails)
         """
@@ -512,6 +538,30 @@ class TargetConnector:
                 target_user,
                 user_role,
             )
+
+            # 4. 第 0 秒目標端自主定時自毀 (Target-side Autonomous Self-Lock)
+            # 設計準則：防範但不禁止。若管理者/部門設定 ttl_minutes <= 0 (無上限)，
+            # schedule_autonomous_self_lock 內部自動跳過定時器植入，完全尊重設定人。
+            host_id_val = str(host_info.get("host_id") or host_info.get("id") or host_info.get("host", "unknown"))
+            if session_id:
+                if ttl_minutes > 0:
+                    await self.jit_provisioner.schedule_autonomous_self_lock(
+                        bootstrap_conn, target_user, session_id, ttl_minutes
+                    )
+                    # 登記至延遲補償佇列 (Pending Cleanups Queue)
+                    if self.storage:
+                        self.storage.enqueue_cleanup(
+                            session_id=session_id,
+                            host_id=host_id_val,
+                            target_user=target_user,
+                            ttl_minutes=ttl_minutes,
+                        )
+                else:
+                    logger.info(
+                        "[JIT_UNLIMITED_SESSION] 會話 [ID: %s] 時效設定為無上限 (ttl=%d)，跳過目標端自毀與補償佇列登記 (Unlimited session: skipping lock and queue)",
+                        session_id,
+                        ttl_minutes,
+                    )
         except Exception as err:
             logger.error("[JIT_PROVISION_ERROR] JIT 調度執行失敗: %s (JIT provision execution error: %s)", err, err)
             if isinstance(err, (JitProvisionError, ValueError)):
@@ -531,6 +581,8 @@ class TargetConnector:
         term_height: int = 24,
         term_type: str = "xterm-256color",
         timeout: float = 10.0,
+        session_id: Optional[str] = None,
+        ttl_minutes: int = 0,
     ) -> TargetSession:
         """
         建立與目標伺服器的非阻塞 SSH 通道並分配遠端 PTY。
@@ -557,7 +609,17 @@ class TargetConnector:
             else:
                 target_user = default_user_tpl
 
-        # 2. 解析並解密連線憑證 (或動態簽署雙軌 CA 短期憑證)
+        # 2. 解析生效之連線逾時 (優先採納主機個別自訂值)
+        actual_timeout = timeout
+        if host_info and host_info.get("connect_timeout"):
+            try:
+                ct = float(host_info["connect_timeout"])
+                if ct > 0:
+                    actual_timeout = ct
+            except (ValueError, TypeError):
+                pass
+
+        # 3. 解析並解密連線憑證 (或動態簽署雙軌 CA 短期憑證)
         target_password: Optional[str] = None
         client_keys: List[Any] = []
         cert_info: Optional[Dict[str, Any]] = None
@@ -570,12 +632,14 @@ class TargetConnector:
                 login_username,
                 target_user,
             )
-            # 1. 建立管理引導通道並調度帳號與 Sudoers
+            # 1. 建立管理引導通道並調度帳號與 Sudoers，注入第 0 秒自主自毀與延遲補償登記
             await self._run_jit_bootstrap(
                 host_info=host_info,
                 login_username=login_username,
                 target_user=target_user,
-                timeout=timeout,
+                timeout=actual_timeout,
+                session_id=session_id,
+                ttl_minutes=ttl_minutes,
             )
             # 2. 簽發 300 秒專屬個人短期憑證並建立正式目標連線
             conn, cert_info = await self._connect_with_ca_cert(
@@ -584,7 +648,7 @@ class TargetConnector:
                 target_user=target_user,
                 login_username=login_username,
                 system_hint=host_info.get("system", ""),
-                timeout=timeout,
+                timeout=actual_timeout,
                 valid_seconds=300,
             )
 
@@ -596,7 +660,7 @@ class TargetConnector:
                 target_user=target_user,
                 login_username=login_username,
                 system_hint=host_info.get("system", ""),
-                timeout=timeout,
+                timeout=actual_timeout,
                 valid_seconds=300,
             )
 
@@ -614,11 +678,12 @@ class TargetConnector:
                     logger.warning("[CRED_DECRYPT_FAILED] 解密主機憑證失敗，將嘗試以預設方式連線: %s (Failed to decrypt host credential, trying default: %s)", err, err)
 
             logger.info(
-                "[CONNECTING] 正在建立通道至 %s:%d (帳號: %s, 模式: %s) (Establishing channel to %s:%d)",
+                "[CONNECTING] 正在建立通道至 %s:%d (帳號: %s, 模式: %s, 逾時: %.1fs) (Establishing channel to %s:%d)",
                 host,
                 port,
                 target_user,
                 provision_mode,
+                actual_timeout,
                 host,
                 port,
             )
@@ -636,10 +701,10 @@ class TargetConnector:
                 }
                 conn = await asyncio.wait_for(
                     asyncssh.connect(**connect_kwargs),
-                    timeout=timeout,
+                    timeout=actual_timeout,
                 )
             except asyncio.TimeoutError:
-                raise ConnectionError(t("conn_err.timeout", timeout=timeout, endpoint=f"{host}:{port}", default=f"連線至目標主機超時 (超過 {timeout}s): {host}:{port}"))
+                raise ConnectionError(t("conn_err.timeout", timeout=actual_timeout, endpoint=f"{host}:{port}", default=f"連線至目標主機超時 (超過 {actual_timeout}s): {host}:{port}"))
             except asyncssh.PermissionDenied as err:
                 raise PermissionError(t("conn_err.denied", default="目標主機拒絕連線 (帳號不存在或憑證金鑰錯誤)"))
             except Exception as err:
@@ -678,4 +743,9 @@ class TargetConnector:
             probe_data=probe_data,
             provision_mode=provision_mode,
             cert_info=cert_info,
+            session_id=session_id,
+            host_id=str(host_info.get("host_id") or host_info.get("id") or host),
+            storage=self.storage,
+            jit_provisioner=self.jit_provisioner,
+            ttl_minutes=ttl_minutes,
         )

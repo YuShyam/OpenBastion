@@ -14,16 +14,18 @@ Standard RFC 4253 non-blocking SSH-2.0 gateway listener powered by asyncssh & SQ
 """
 
 import asyncio
+import inspect
 import logging
 import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Awaitable, Dict, List, Optional, Sequence, Tuple, Union
 
 import asyncssh
 
 from core.audit import AuditEngine
+from core.auth import AuthUser, IAuthProvider, IMfaProvider, SqliteAuthProvider, TotpMfaProvider
 from core.banner import (
     BannerContext,
     DefaultTemplateBannerProvider,
@@ -33,7 +35,7 @@ from core.banner import (
 from core.ca import CertificateAuthorityManager
 from core.connector import TargetConnector, TargetSession
 from core.i18n import get_locale, get_supported_locales_info, set_locale, t
-from core.menu import TerminalMenu
+from core.menu import AnsiSanitizer, TerminalMenu
 from core.pipe import StreamPipe
 from core.recorder import AsciinemaRecorder
 from core.storage import StorageProvider
@@ -272,6 +274,58 @@ class OpenBastionSSHServer(asyncssh.SSHServer):
         """
         self.gateway = gateway
         self.authenticated_user: Optional[Dict[str, Any]] = None
+        self._kbdint_stage: int = 0
+        self._candidate_auth_user: Optional[AuthUser] = None
+        self._candidate_user_dict: Optional[Dict[str, Any]] = None
+        self._conn: Optional[asyncssh.SSHServerConnection] = None
+        self._banner_sent: bool = False
+
+    def connection_made(self, conn: asyncssh.SSHServerConnection) -> None:
+        """
+        底層 TCP 與 SSH 握手建立連線回呼，記錄連線實例。
+        Callback when underlying SSH connection is established, recording connection instance.
+        """
+        self._conn = conn
+
+    def begin_auth(self, username: str) -> bool:
+        """
+        當客戶端發起認證請求時呼叫，透過 RFC 4252 標準通道發送中英雙軌安全鑑權 Banner。
+        Called when client begins authentication, sending bilingual auth banner via RFC 4252.
+        自適應辨識穿透直連 (username#target) 與標準選單模式，並於 78 欄位安全線內排版。
+        """
+        if self._conn and not self._banner_sent:
+            try:
+                is_direct = "#" in username
+                effective_user = username.split("#", 1)[0] if is_direct else username
+                if is_direct:
+                    target_str = username.split("#", 1)[1]
+                    mode_hint = f"直連 {target_str} (Direct)"
+                else:
+                    mode_hint = "主機選單 (Host Menu)"
+
+                inner_w = 74
+                title_line = AnsiSanitizer.pad("OpenBastion 身分驗證 (Authentication)", inner_w, align="center")
+                user_mode = f"帳號 (User): {effective_user:<16} 模式 (Mode): {mode_hint}"
+                user_line = AnsiSanitizer.pad(f"  {user_mode}", inner_w, align="left")
+                hint_line1 = AnsiSanitizer.pad("  說明: 請輸入密碼；若已啟用 MFA，驗證後請接著輸入動態碼或備援碼。", inner_w, align="left")
+                hint_line2 = AnsiSanitizer.pad("  Hint: Enter password. If MFA is enabled, enter TOTP or recovery code.", inner_w, align="left")
+
+                banner = (
+                    "\r\n"
+                    "+----------------------------------------------------------------------------+\r\n"
+                    f"| {title_line} |\r\n"
+                    "+----------------------------------------------------------------------------+\r\n"
+                    f"| {user_line} |\r\n"
+                    f"| {hint_line1} |\r\n"
+                    f"| {hint_line2} |\r\n"
+                    "+----------------------------------------------------------------------------+\r\n\r\n"
+                )
+                self._conn.send_auth_banner(banner)
+                self._banner_sent = True
+            except Exception as e:
+                logger.debug("發送認證橫幅時忽略異常: %s (Ignored auth banner error)", e)
+
+        return True
 
     def password_auth_supported(self) -> bool:
         """
@@ -280,21 +334,255 @@ class OpenBastionSSHServer(asyncssh.SSHServer):
         """
         return True
 
-    def validate_password(self, username: str, password: str) -> bool:
+    def kbdint_auth_supported(self) -> bool:
         """
-        驗證連線者之帳號密碼 (接軌 SQLite PBKDF2 加鹽雜湊比對)。
-        Validate client credentials against SQLite using PBKDF2 constant-time verification.
-        支援使用者名稱穿透直連語法 (如: admin#192.168.31.129 或 admin#3)。
+        宣告本閘道支援 RFC 4256 鍵盤互動式動態鑑權 (支援 MFA 雙因子延伸)。
+        Declare that RFC 4256 keyboard-interactive authentication is supported.
+        """
+        return True
+
+    def get_kbdint_challenge(
+        self, username: str, lang: str, submethods: str
+    ) -> Tuple[str, str, str, List[Tuple[str, bool]]]:
+        """
+        發起 RFC 4256 鍵盤互動認證第一階段挑戰 (密碼輸入)。
+        Issue Stage 1 challenge for keyboard-interactive authentication requesting password.
+        """
+        self._kbdint_stage = 0
+        self._candidate_auth_user = None
+        self._candidate_user_dict = None
+        name = "OpenBastion Authentication"
+        instructions = ""
+        prompts = [("Password: ", False)]
+        return name, instructions, lang, prompts
+
+    async def validate_kbdint_response(
+        self, username: str, responses: Sequence[str]
+    ) -> Union[bool, Tuple[str, str, str, List[Tuple[str, bool]]]]:
+        """
+        校驗 RFC 4256 鍵盤互動回傳值並執行二階瀑布流狀態機。
+        Validate keyboard-interactive responses and progress through two-stage waterfall authentication.
+        - Stage 0: 驗證帳號密碼。若未啟用 MFA 則直接放行 (True)；若啟用則發起第二階動態碼挑戰。
+        - Stage 1: 驗證 TOTP 動態碼或緊急備援碼。校驗成功放行 (True)，失敗駁回 (False)。
         """
         effective_user = username.split("#", 1)[0] if "#" in username else username
-        ok, user = self.gateway.storage.authenticate(effective_user, password)
-        if ok and user:
-            logger.info("[AUTH_OK] 使用者 '%s' [連線標的: '%s'] 密碼加鹽鑑權成功 (Password authentication succeeded)", effective_user, username)
-            self.authenticated_user = user
-            return True
 
-        logger.warning("[AUTH_DENIED] 使用者 '%s' 憑證驗證失敗或查無帳號 (Authentication failed or user not found)", username)
+        auth_provider = getattr(self.gateway, "auth_provider", None)
+        if not isinstance(auth_provider, IAuthProvider):
+            storage = getattr(self.gateway, "storage", None)
+            auth_provider = SqliteAuthProvider(storage=storage) if storage is not None else SqliteAuthProvider()
+
+        mfa_provider = getattr(self.gateway, "mfa_provider", None)
+        if not isinstance(mfa_provider, IMfaProvider):
+            storage = getattr(self.gateway, "storage", None)
+            mfa_provider = TotpMfaProvider(storage=storage)
+
+        # Stage 0: 第一階段 (密碼鑑權)
+        if self._kbdint_stage == 0:
+            password = responses[0] if responses else ""
+            try:
+                res = auth_provider.authenticate(effective_user, password)
+                if inspect.isawaitable(res):
+                    ok, auth_user = await res
+                else:
+                    ok, auth_user = res
+            except Exception as e:
+                logger.error(
+                    "[KBDINT_ERR] 使用者 '%s' 鍵盤互動認證管線執行異常: %s (Kbdint auth pipeline error)",
+                    username,
+                    e,
+                )
+                return False
+
+            if not ok or not auth_user:
+                logger.warning(
+                    "[KBDINT_DENIED] 使用者 '%s' 密碼校驗失敗或查無帳號 (Stage 0 password failed)",
+                    username,
+                )
+                return False
+
+            if isinstance(auth_user, AuthUser):
+                user_dict = auth_user.raw_user or {
+                    "id": auth_user.id,
+                    "username": auth_user.username,
+                    "display_name": auth_user.display_name,
+                    "role": auth_user.role,
+                    "department": auth_user.department,
+                    "user_id": auth_user.user_id,
+                }
+            elif isinstance(auth_user, dict):
+                user_dict = auth_user
+            else:
+                user_dict = {"username": effective_user}
+
+            self._candidate_auth_user = auth_user if isinstance(auth_user, AuthUser) else AuthUser(
+                id=user_dict.get("id", 0),
+                username=user_dict.get("username", effective_user),
+                display_name=user_dict.get("display_name", effective_user),
+                role=user_dict.get("role", "user"),
+                department=user_dict.get("department", "default"),
+                user_id=user_dict.get("user_id", effective_user),
+                mfa_enabled=bool(user_dict.get("mfa_enabled", False)),
+                mfa_secret=user_dict.get("mfa_secret"),
+                raw_user=user_dict,
+            )
+            self._candidate_user_dict = user_dict
+
+            # 判定是否需第二因子挑戰 (貫徹防範但不禁止，未啟用 MFA 者平滑放行)
+            if not mfa_provider.is_enabled_for_user(self._candidate_auth_user):
+                self.authenticated_user = self._candidate_user_dict
+                logger.info(
+                    "[KBDINT_OK] 使用者 '%s' 密碼驗證通過 (未啟用 MFA，平滑放行) (Password authenticated, MFA bypassed)",
+                    effective_user,
+                )
+                return True
+
+            # 進入 Stage 1: 發起第二階 MFA 動態碼挑戰
+            self._kbdint_stage = 1
+            challenge = mfa_provider.get_challenge(self._candidate_auth_user, lang="")
+            logger.info(
+                "[MFA_CHALLENGE] 使用者 '%s' 已啟動 MFA，已發起第二階動態碼挑戰 (Stage 1 MFA challenge issued)",
+                effective_user,
+            )
+            return challenge
+
+        # Stage 1: 第二階段 (MFA 動態碼校驗)
+        elif self._kbdint_stage == 1:
+            if not self._candidate_auth_user:
+                return False
+
+            try:
+                mfa_res = mfa_provider.verify_response(self._candidate_auth_user, list(responses))
+                if inspect.isawaitable(mfa_res):
+                    mfa_ok = await mfa_res
+                else:
+                    mfa_ok = mfa_res
+            except Exception as e:
+                logger.error(
+                    "[MFA_ERR] 使用者 '%s' 第二因子驗證過程異常: %s (MFA verification error)",
+                    username,
+                    e,
+                )
+                return False
+
+            if mfa_ok:
+                self.authenticated_user = self._candidate_user_dict
+                logger.info(
+                    "[MFA_SUCCESS] 使用者 '%s' 雙因子認證全面通過，准予登入 (MFA verification succeeded, login approved)",
+                    effective_user,
+                )
+                return True
+
+            logger.warning(
+                "[MFA_FAILED] 使用者 '%s' 第二因子動態碼校驗失敗 (MFA verification failed)",
+                effective_user,
+            )
+            return False
+
         return False
+
+    def validate_password(
+        self, username: str, password: str
+    ) -> Union[bool, Awaitable[bool]]:
+        """
+        驗證連線者之帳號密碼 (接軌 IAuthProvider SPI 可抽換鑑權管線)。
+        Validate client credentials against configured IAuthProvider SPI using constant-time comparison.
+        支援使用者名稱穿透直連語法 (如: admin#192.168.31.129 或 admin#3)。
+        支援同步與非同步雙軌回傳 (Returns bool directly for sync providers or Awaitable[bool] for async).
+        若使用者啟用 MFA，則拒絕純密碼直接放行，強制要求透過 RFC 4256 鍵盤互動協定完成驗證。
+        """
+        effective_user = username.split("#", 1)[0] if "#" in username else username
+
+        # 取得鑑權提供者；若為 mock 物件或未配置，自動適配相容既有 storage 驅動
+        auth_provider = getattr(self.gateway, "auth_provider", None)
+        if not isinstance(auth_provider, IAuthProvider):
+            storage = getattr(self.gateway, "storage", None)
+            if storage is not None:
+                auth_provider = SqliteAuthProvider(storage=storage)
+            elif auth_provider is None:
+                auth_provider = SqliteAuthProvider()
+
+        mfa_provider = getattr(self.gateway, "mfa_provider", None)
+        if not isinstance(mfa_provider, IMfaProvider):
+            storage = getattr(self.gateway, "storage", None)
+            mfa_provider = TotpMfaProvider(storage=storage)
+
+        def _handle_auth_result(auth_res: Tuple[bool, Optional[Any]]) -> bool:
+            ok, auth_user = auth_res
+            if ok and auth_user:
+                candidate_user = auth_user if isinstance(auth_user, AuthUser) else AuthUser(
+                    id=auth_user.get("id", 0) if isinstance(auth_user, dict) else 0,
+                    username=auth_user.get("username", effective_user) if isinstance(auth_user, dict) else effective_user,
+                    display_name=auth_user.get("display_name", effective_user) if isinstance(auth_user, dict) else effective_user,
+                    role=auth_user.get("role", "user") if isinstance(auth_user, dict) else "user",
+                    department=auth_user.get("department", "default") if isinstance(auth_user, dict) else "default",
+                    user_id=auth_user.get("user_id", effective_user) if isinstance(auth_user, dict) else effective_user,
+                    mfa_enabled=bool(auth_user.get("mfa_enabled", False)) if isinstance(auth_user, dict) else False,
+                    mfa_secret=auth_user.get("mfa_secret") if isinstance(auth_user, dict) else None,
+                    raw_user=auth_user if isinstance(auth_user, dict) else None,
+                )
+
+                if mfa_provider.is_enabled_for_user(candidate_user):
+                    logger.warning(
+                        "[MFA_ENFORCED] 使用者 '%s' 已啟用 MFA 雙因子驗證，拒絕純密碼直接放行，強制要求鍵盤互動協定 (MFA enforced, keyboard-interactive required)",
+                        effective_user,
+                    )
+                    return False
+
+                if isinstance(auth_user, AuthUser):
+                    user_dict = auth_user.raw_user or {
+                        "id": auth_user.id,
+                        "username": auth_user.username,
+                        "display_name": auth_user.display_name,
+                        "role": auth_user.role,
+                        "department": auth_user.department,
+                        "user_id": auth_user.user_id,
+                    }
+                elif isinstance(auth_user, dict):
+                    user_dict = auth_user
+                else:
+                    user_dict = {"username": effective_user}
+
+                self.authenticated_user = user_dict
+                logger.info(
+                    "[AUTH_OK] 使用者 '%s' [連線標的: '%s'] 密碼鑑權成功 (Password authentication succeeded)",
+                    effective_user,
+                    username,
+                )
+                return True
+
+            logger.warning(
+                "[AUTH_DENIED] 使用者 '%s' 憑證驗證失敗或查無帳號 (Authentication failed or user not found)",
+                username,
+            )
+            return False
+
+        try:
+            res = auth_provider.authenticate(effective_user, password)
+            if inspect.isawaitable(res):
+
+                async def _async_val() -> bool:
+                    try:
+                        awaited_res = await res
+                        return _handle_auth_result(awaited_res)
+                    except Exception as e:
+                        logger.error(
+                            "[AUTH_ERR] 使用者 '%s' 非同步認證管線執行異常: %s (Auth pipeline error)",
+                            username,
+                            e,
+                        )
+                        return False
+
+                return _async_val()
+            else:
+                return _handle_auth_result(res)
+        except Exception as e:
+            logger.error(
+                "[AUTH_ERR] 使用者 '%s' 認證管線執行異常: %s (Auth pipeline error)",
+                username,
+                e,
+            )
+            return False
 
 
 class GatewayListener:
@@ -314,14 +602,31 @@ class GatewayListener:
         connector: Optional[TargetConnector] = None,
         recordings_dir: Optional[Path] = None,
         ca_mgr: Optional[CertificateAuthorityManager] = None,
+        auth_provider: Optional[IAuthProvider] = None,
+        mfa_provider: Optional[IMfaProvider] = None,
     ) -> None:
         """
         初始化 SSH-2.0 閘道監聽實例。
         Initialize the non-blocking SSH-2.0 gateway listener instance.
+
+        參數 / Args:
+            host: 監聽 IP 位址 (預設 0.0.0.0)
+            port: 監聽連接埠 (預設 2222)
+            storage: 核心資料庫儲存驅動實例 (預設自動建立 StorageProvider)
+            host_key_path: 向後相容用金鑰路徑參數
+            vault: 憑證保險箱實例 (預設自動建立 CredentialVault)
+            banner_provider: 迎賓資訊渲染提供者 (預設 DefaultTemplateBannerProvider)
+            connector: 目標受控端連線器 (預設自動建立 TargetConnector)
+            recordings_dir: 會話錄影存放路徑 (預設 recordings)
+            ca_mgr: OpenSSH CA 憑證管理器 (預設自動建立 CertificateAuthorityManager)
+            auth_provider: 身分驗證提供者 (預設自動建立 SqliteAuthProvider)
+            mfa_provider: 雙因子驗證提供者 (預設自動建立 TotpMfaProvider)
         """
         self.host = host
         self.port = port
         self.storage = storage or StorageProvider()
+        self.auth_provider = auth_provider or SqliteAuthProvider(storage=self.storage)
+        self.mfa_provider = mfa_provider or TotpMfaProvider(storage=self.storage)
         self._host_key_path_compat = host_key_path
         self.vault = vault or CredentialVault()
         self.banner_provider = banner_provider or DefaultTemplateBannerProvider()
@@ -463,11 +768,35 @@ class GatewayListener:
         peername = process.get_extra_info("peername")
         client_ip = peername[0] if peername else "unknown"
 
-        # 自儲存層取得使用者資訊 (角色、部門)
-        user_info = self.storage.get_user_by_username(username) or {}
-        role = user_info.get("role", "user")
-        dept = user_info.get("department", "default")
-        user_id = user_info.get("user_id", username)
+        # 自認證提供者或儲存層取得使用者資訊 (角色、部門)
+        auth_user_obj = None
+        try:
+            u_res = self.auth_provider.get_user(username)
+            if inspect.isawaitable(u_res):
+                auth_user_obj = await u_res
+            else:
+                auth_user_obj = u_res
+        except Exception:
+            pass
+
+        dept_id = None
+        if auth_user_obj:
+            role = auth_user_obj.role
+            dept = auth_user_obj.department
+            user_id = auth_user_obj.user_id or username
+            if auth_user_obj.raw_user:
+                dept_id = auth_user_obj.raw_user.get("department_id")
+        else:
+            user_info = self.storage.get_user_by_username(username) or {}
+            role = user_info.get("role", "user")
+            dept = user_info.get("department", "default")
+            user_id = user_info.get("user_id", username)
+            dept_id = user_info.get("department_id")
+
+        if dept_id is None and dept:
+            dept_entity = self.storage.get_department_by_name(dept) or self.storage.get_department_by_code(dept)
+            if dept_entity:
+                dept_id = dept_entity.get("id")
 
         # 登記連線會話
         session_id = self.storage.create_session(
@@ -485,6 +814,8 @@ class GatewayListener:
         # 讀取使用者專屬個人偏好 (Preferences)
         user_prefs = self.storage.get_user_preferences(user_id)
         current_page = 1
+        page_size_val = int(user_prefs.get("page_size", 8))
+        escape_key_val = user_prefs.get("escape_key", "ctrl_]")
         view_mode = user_prefs.get("view", "system")
         search_query = None
         current_locale = user_prefs.get("locale", get_locale())
@@ -524,6 +855,7 @@ class GatewayListener:
             ]
             return menu.render(
                 page=current_page,
+                page_size=page_size_val,
                 view_mode=view_mode,
                 search_query=search_query,
                 locale=current_locale,
@@ -610,9 +942,38 @@ class GatewayListener:
                             await process.stdout.drain()
                         continue
 
+                    # 自訂分頁筆數指令 (page <N> / :page <N>)
+                    if raw_cmd.startswith("page ") or raw_cmd.startswith(":page "):
+                        parts = raw_cmd.replace(":", "").split()
+                        if len(parts) >= 2 and parts[1].isdigit():
+                            new_ps = max(1, min(50, int(parts[1])))
+                            page_size_val = new_ps
+                            user_prefs["page_size"] = new_ps
+                            self.storage.update_user_preference(user_id, "page_size", new_ps)
+                            current_page = 1
+                            process.stdout.write(await render_current_menu())
+                            await process.stdout.drain()
+                            continue
+
+                    # 自訂逃逸按鍵指令 (escape <key> / :escape <key>)
+                    if raw_cmd.startswith("escape ") or raw_cmd.startswith(":escape "):
+                        parts = raw_cmd.replace(":", "").split()
+                        if len(parts) >= 2:
+                            new_esc = parts[1].strip()
+                            escape_key_val = new_esc
+                            user_prefs["escape_key"] = new_esc
+                            self.storage.update_user_preference(user_id, "escape_key", new_esc)
+                            msg = t("gateway.escape_key_updated", locale=current_locale, key=new_esc, default=f"逃逸按鍵已更新為: {new_esc} (Escape key updated)")
+                            process.stdout.write(f"\r\n\033[1;32m>>> {msg}\033[0m\r\n\r\n")
+                            await process.stdout.drain()
+                            process.stdout.write(await render_current_menu())
+                            await process.stdout.drain()
+                            continue
+
                     action, payload = menu.resolve_action(
                         raw_cmd,
                         current_page=current_page,
+                        page_size=page_size_val,
                         view_mode=view_mode,
                         search_query=search_query,
                     )
@@ -764,7 +1125,14 @@ class GatewayListener:
                     process.stdout.write(f"\033[1;36m>>> {conn_hint} ({h_display})\033[0m\r\n")
                     await process.stdout.drain()
 
-                    # 2. 建立與目標主機的 SSH 連線、採集主機指標與分配 PTY
+                    # 提前計算該連線生效之時效硬約束 (Max Session TTL & Idle Timeout)
+                    max_ttl_sec, idle_sec = self.storage.get_effective_session_limits(
+                        department_id=dept_id,
+                        department_code=dept,
+                    )
+                    ttl_minutes_val = max_ttl_sec // 60 if max_ttl_sec > 0 else 0
+
+                    # 2. 建立與目標主機的 SSH 連線、採集主機指標與分配 PTY (注入第 0 秒自主預約鎖定)
                     try:
                         target_session = await self.connector.connect(
                             host_info=host_info,
@@ -772,7 +1140,9 @@ class GatewayListener:
                             term_width=term_width,
                             term_height=term_height,
                             term_type=term_type,
-                            timeout=10.0,
+                            timeout=float(host_info.get("connect_timeout") or 10.0),
+                            session_id=session_id,
+                            ttl_minutes=ttl_minutes_val,
                         )
                         if host_id:
                             self.storage.update_session_host(session_id, str(host_id))
@@ -935,7 +1305,7 @@ class GatewayListener:
                         on_block_action=handle_block,
                     )
 
-                    # 6. 建立雙向非阻塞字元水管 (Stream Pipe)
+                    # 6. 建立雙向非阻塞字元水管 (Stream Pipe) 兼時效看門狗
                     pipe = StreamPipe(
                         client_reader=process.stdin,
                         client_writer=process.stdout,
@@ -944,6 +1314,9 @@ class GatewayListener:
                         target_process=target_session.process,
                         on_input=lambda data: (recorder.record_input(data), audit_engine.feed_keystroke(data)),
                         on_output=lambda data: recorder.record_output(data),
+                        max_ttl_seconds=max_ttl_sec,
+                        idle_timeout_seconds=idle_sec,
+                        escape_key=escape_key_val,
                     )
                     pipe_ref["pipe"] = pipe
 
@@ -953,6 +1326,14 @@ class GatewayListener:
                     except Exception as run_err:
                         logger.warning("[PIPE_ERROR] 轉發水管執行異常: %s (Forwarding pipe execution exception: %s)", run_err, run_err)
                         exit_reason = "error"
+
+                    if exit_reason in ("idle_timeout", "max_ttl_expired"):
+                        logger.warning(
+                            "[SESSION_TIMED_OUT] 使用者 '%s' 會話 [ID: %s] 觸發時效限制中斷 (原因: %s) (Session terminated by timeout)",
+                            username,
+                            session_id,
+                            exit_reason,
+                        )
 
                     if exit_reason == "escape":
                         slot_id = await self.session_pool.put_session(
